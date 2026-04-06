@@ -130,14 +130,15 @@ jobs:
 
             if (fs.existsSync(changelogPath)) {
               const changelogText = fs.readFileSync(changelogPath, 'utf8')
+                .replace(/\r\n/g, '\n')
               for (const candidate of versionCandidates) {
                 const sectionRegex = new RegExp(
-                  `^##\\s*\\[?v?${escapeRegex(candidate)}\\]?[^\\n]*\\n([\\s\\S]*?)(?=\\n##\\s+|\\n#\\s+|$)`,
-                  'm',
+                  `(?:^|\\n)##\\s*\\[?v?${escapeRegex(candidate)}\\]?[^\\n]*\\n([\\s\\S]*?)(?=\\n##\\s+|\\n#\\s+|$)`,
                 )
                 const sectionMatch = changelogText.match(sectionRegex)
-                if (sectionMatch?.[1]) {
-                  releaseBody = sectionMatch[1].trim()
+                const sectionBody = String(sectionMatch?.[1] || '').trim()
+                if (sectionBody) {
+                  releaseBody = sectionBody
                   break
                 }
               }
