@@ -1,0 +1,46 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "AetherStream",
+  "mainBinaryName": "AetherStream",
+  "version": "0.1.0",
+  "identifier": "com.aetherstream.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AetherStream",
+        "width": 1200,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 720,
+        "backgroundColor": "#0f0f0f",
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": false,
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI --disable-logging --log-level=3 --v=0"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' https://api.twitch.tv https://id.twitch.tv https://badges.twitch.tv https://static-cdn.jtvnw.net https://*.twitch.tv wss://*.twitch.tv wss://irc-ws.chat.twitch.tv https://*.tts.speech.microsoft.com https://api.github.com ws://127.0.0.1:*; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; script-src 'self'; media-src 'self' blob: data:; object-src 'none'",
+      "devCsp": "default-src 'self'; connect-src 'self' https://api.twitch.tv https://id.twitch.tv https://badges.twitch.tv https://static-cdn.jtvnw.net https://*.twitch.tv wss://*.twitch.tv wss://irc-ws.chat.twitch.tv https://*.tts.speech.microsoft.com https://api.github.com ws://127.0.0.1:* http://localhost:5173 ws://localhost:5173 http://127.0.0.1:8080; img-src 'self' data: blob: https: http:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; script-src 'self' 'unsafe-eval'; media-src 'self' blob: data:; object-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "Daikh",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

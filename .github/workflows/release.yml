@@ -1,0 +1,202 @@
+name: Release Build
+run-name: Release ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (example: v0.1.0)'
+        required: true
+        type: string
+      release_name:
+        description: 'Optional release title (example: AetherStream First Public Build)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "Tag is empty" >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          if [ "$VERSION" = "$TAG" ]; then
+            echo "Tag must start with v (for example: v0.1.0)" >&2
+            exit 1
+          fi
+
+          if [[ "$TAG" == *"-alpha"* || "$TAG" == *"-beta"* || "$TAG" == *"-rc"* ]]; then
+            PRERELEASE="true"
+          else
+            PRERELEASE="false"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate version consistency
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          node - <<'NODE'
+          const fs = require('fs')
+
+          const expected = process.env.EXPECTED_VERSION
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'))
+          const tauri = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8'))
+          const cargoToml = fs.readFileSync('src-tauri/Cargo.toml', 'utf8')
+          const cargoMatch = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)
+          const cargoVersion = cargoMatch ? cargoMatch[1] : ''
+
+          const checks = [
+            ['package.json', pkg.version],
+            ['src-tauri/tauri.conf.json', tauri.version],
+            ['src-tauri/Cargo.toml', cargoVersion],
+          ]
+
+          const mismatches = checks.filter(([, value]) => value !== expected)
+          if (mismatches.length > 0) {
+            console.error(`Version mismatch for tag v${expected}`)
+            mismatches.forEach(([file, value]) => {
+              console.error(`- ${file}: ${value || '(missing)'}`)
+            })
+            process.exit(1)
+          }
+
+          console.log(`Version check passed for v${expected}`)
+          NODE
+
+      - name: Prepare release notes from changelog
+        id: notes
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_NAME_INPUT: ${{ inputs.release_name || '' }}
+        with:
+          script: |
+            const fs = require('fs')
+            const tag = process.env.RELEASE_TAG
+            const version = process.env.RELEASE_VERSION
+            const manualReleaseName = String(process.env.RELEASE_NAME_INPUT || '').trim()
+            const changelogPath = 'CHANGELOG.md'
+
+            const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            let releaseBody = ''
+            const versionCandidates = [version]
+            if (String(version).includes('-')) {
+              const stableVersion = String(version).split('-')[0]
+              if (stableVersion && stableVersion !== version) {
+                versionCandidates.push(stableVersion)
+              }
+            }
+
+            if (fs.existsSync(changelogPath)) {
+              const changelogText = fs.readFileSync(changelogPath, 'utf8')
+              for (const candidate of versionCandidates) {
+                const sectionRegex = new RegExp(
+                  `^##\\s*\\[?v?${escapeRegex(candidate)}\\]?[^\\n]*\\n([\\s\\S]*?)(?=\\n##\\s+|\\n#\\s+|$)`,
+                  'm',
+                )
+                const sectionMatch = changelogText.match(sectionRegex)
+                if (sectionMatch?.[1]) {
+                  releaseBody = sectionMatch[1].trim()
+                  break
+                }
+              }
+            }
+
+            if (!releaseBody) {
+              releaseBody = [
+                `Release ${tag}`,
+                '',
+                '- Build artifacts attached automatically.',
+                `- Full commit history: https://github.com/${context.repo.owner}/${context.repo.repo}/commits/${tag}`,
+              ].join('\n')
+            }
+
+            core.setOutput('release_name', manualReleaseName || `AetherStream ${tag}`)
+            core.setOutput('release_body', releaseBody)
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build desktop installers
+        run: npm run tauri:build
+
+      - name: Validate installer artifacts
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          EXE_PATH="src-tauri/target/release/bundle/installers/AetherStream_${VERSION}.exe"
+          MSI_PATH="src-tauri/target/release/bundle/installers/AetherStream_${VERSION}.msi"
+
+          MISSING=0
+
+          if [ ! -f "$EXE_PATH" ]; then
+            echo "Missing installer: $EXE_PATH" >&2
+            MISSING=1
+          fi
+
+          if [ ! -f "$MSI_PATH" ]; then
+            echo "Missing installer: $MSI_PATH" >&2
+            MISSING=1
+          fi
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "Release aborted because both installers are required." >&2
+            exit 1
+          fi
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.notes.outputs.release_name }}
+          body: ${{ steps.notes.outputs.release_body }}
+          draft: false
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/release/bundle/installers/AetherStream_${{ steps.meta.outputs.version }}.exe
+            src-tauri/target/release/bundle/installers/AetherStream_${{ steps.meta.outputs.version }}.msi

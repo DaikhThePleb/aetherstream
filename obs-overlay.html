@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <title>OBS Chat Overlay - AetherStream Style</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            /* Alapértelmezett AetherStream színek */
+            --accent-primary: #00f2ff;
+            --accent-secondary: #8000ff;
+            
+            --bg-panel: rgba(16, 16, 20, 0.95);
+            --text-color: #ffffff;
+            --font-family: 'Inter', sans-serif;
+
+            /* Skálázás alapja */
+            --scale-factor: 1;
+        }
+
+        body {
+            background: transparent;
+            overflow: hidden;
+            font-family: var(--font-family);
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            width: 100vw;
+            font-size: calc(16px * var(--scale-factor));
+        }
+
+        #overlay-root {
+            position: fixed;
+            inset: 0;
+            overflow: hidden;
+        }
+
+        #overlay-root.overlay-hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        #overlay-stage {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 1920px;
+            height: 1080px;
+            transform-origin: top left;
+        }
+
+        #chat-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: calc(600px * var(--scale-factor));
+            height: auto;
+            max-height: 90%;
+            transform-origin: top left;
+            
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: flex-start;
+            gap: calc(15px * var(--scale-factor));
+            
+            pointer-events: none;
+            overflow: hidden;
+        }
+
+        .status-indicator {
+            position: absolute;
+            display: inline-flex;
+            padding: calc(8px * var(--scale-factor)) calc(12px * var(--scale-factor));
+            border-radius: calc(14px * var(--scale-factor));
+            background: rgba(16, 16, 20, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+            backdrop-filter: blur(8px);
+            pointer-events: none;
+            transform-origin: top left;
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: calc(6px * var(--scale-factor));
+            font-size: calc(11px * var(--scale-factor));
+            font-weight: 700;
+            letter-spacing: 0.6px;
+            text-transform: uppercase;
+            color: #f8fafc;
+        }
+
+        .status-dot {
+            width: calc(8px * var(--scale-factor));
+            height: calc(8px * var(--scale-factor));
+            border-radius: 999px;
+            background: #64748b;
+            box-shadow: 0 0 6px rgba(0, 0, 0, 0.4);
+        }
+
+        .status-dot.is-online {
+            background: #22c55e;
+            box-shadow: 0 0 10px rgba(34, 197, 94, 0.6);
+            animation: statusPulse 1.6s ease-in-out infinite;
+        }
+
+        .status-dot.is-paused {
+            background: #f59e0b;
+        }
+
+        .status-dot.is-connecting {
+            background: #fbbf24;
+            animation: statusPulse 1.6s ease-in-out infinite;
+        }
+
+        @keyframes statusPulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.15); }
+        }
+
+        .chat-card {
+            display: flex;
+            align-items: flex-end;
+            gap: calc(15px * var(--scale-factor));
+            
+            opacity: 0;
+            transform: translateX(calc(-50px * var(--scale-factor))) scale(0.9);
+            transform-origin: left bottom;
+            transition: all 0.5s cubic-bezier(0.19, 1, 0.22, 1);
+            
+            flex-shrink: 0;
+            max-width: 100%;
+            pointer-events: auto;
+        }
+
+        .chat-card.visible {
+            opacity: 1;
+            transform: translateX(0) scale(1);
+        }
+
+        .chat-card.hiding {
+            opacity: 0;
+            transform: scale(0.97);
+            transition: opacity 0.35s ease, transform 0.35s ease;
+        }
+
+        .avatar-box {
+            width: calc(64px * var(--scale-factor));
+            height: calc(64px * var(--scale-factor));
+            
+            /* EREDETI: border-radius: calc(16px * var(--scale-factor)); */
+            /* ÚJ: Teljesen kör alak */
+            border-radius: 50%; 
+            
+            background: #222;
+            
+            /* Avatar keret */
+            border: calc(2px * var(--scale-factor)) solid var(--accent-primary);
+            
+            overflow: hidden;
+            flex-shrink: 0;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+            z-index: 10;
+            position: relative;
+        }
+        
+        .avatar-box img {
+            width: 100%; height: 100%; object-fit: cover;
+        }
+
+        .content-box {
+            background: var(--bg-panel);
+            padding: calc(16px * var(--scale-factor)) calc(20px * var(--scale-factor));
+            border-radius: calc(16px * var(--scale-factor));
+            border-bottom-left-radius: 4px;
+            
+            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            position: relative;
+            backdrop-filter: blur(10px);
+            
+            min-width: calc(150px * var(--scale-factor));
+        }
+
+        /* A bal oldali színes csík - MOST MÁR GRADIENS */
+        .content-box::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: calc(4px * var(--scale-factor));
+            
+            /* Itt használjuk a két színt, amit az AetherStream küld */
+            background: linear-gradient(to bottom, var(--accent-primary), var(--accent-secondary));
+            
+            border-top-left-radius: calc(16px * var(--scale-factor));
+            border-bottom-left-radius: 4px;
+        }
+
+        .username {
+            font-size: calc(14px * var(--scale-factor));
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: calc(4px * var(--scale-factor));
+            display: flex;
+            align-items: center;
+            gap: calc(6px * var(--scale-factor));
+
+            /* Név színezése: Gradiens szöveg (mint az app logójában) */
+            background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text; 
+        }
+
+        .message-text {
+            font-size: calc(16px * var(--scale-factor));
+            font-weight: 500;
+            color: #eee;
+            line-height: 1.5;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.5);
+            word-wrap: break-word;
+        }
+
+        .badges { display: flex; gap: calc(4px * var(--scale-factor)); }
+        .badges img { height: calc(16px * var(--scale-factor)); width: auto; filter: drop-shadow(0 1px 2px black); }
+
+        .emote-img {
+            display: inline-block; vertical-align: middle;
+            height: calc(28px * var(--scale-factor)); margin: 0 2px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="overlay-root">
+        <div id="overlay-stage">
+            <div id="status-tts" class="status-indicator">
+                <div class="status-pill">
+                    <span class="status-dot" id="status-tts-dot"></span>
+                    <span id="status-tts-label">TTS</span>
+                </div>
+            </div>
+            <div id="status-twitch" class="status-indicator">
+                <div class="status-pill">
+                    <span class="status-dot" id="status-twitch-dot"></span>
+                    <span id="status-twitch-label">TWITCH</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const overlayRoot = document.getElementById('overlay-root');
+        const overlayStage = document.getElementById('overlay-stage');
+        const statusTts = document.getElementById('status-tts');
+        const statusTwitch = document.getElementById('status-twitch');
+        const statusTtsLabel = document.getElementById('status-tts-label');
+        const statusTtsDot = document.getElementById('status-tts-dot');
+        const statusTwitchLabel = document.getElementById('status-twitch-label');
+        const statusTwitchDot = document.getElementById('status-twitch-dot');
+        let lastEventId = 0;
+        let pollingTimer = null;
+        let stateTimer = null;
+        let overlayEnabled = true;
+        let hasInitialSync = false;
+        const POLLING_INTERVAL_MS = 450;
+        const STATE_POLL_INTERVAL_MS = 1200;
+        const overlayToken = new URLSearchParams(window.location.search).get('token') || '';
+        const tokenParam = overlayToken ? `token=${encodeURIComponent(overlayToken)}` : '';
+        const tokenQueryPrefix = tokenParam ? `?${tokenParam}` : '';
+        const tokenQuerySuffix = tokenParam ? `&${tokenParam}` : '';
+
+        const DEFAULT_LAYOUT = {
+            chat: { x: 6, y: 70, scale: 1 },
+            status_tts: { x: 80, y: 6, scale: 1 },
+            status_twitch: { x: 80, y: 12, scale: 1 },
+        };
+
+        const RESOLUTIONS = {
+            '2160p': { width: 3840, height: 2160 },
+            '1440p': { width: 2560, height: 1440 },
+            '1080p': { width: 1920, height: 1080 },
+            '720p': { width: 1280, height: 720 },
+            '480p': { width: 854, height: 480 },
+        };
+
+        let overlayConfig = {
+            overlay_show_chat: false,
+            overlay_show_status: true,
+            overlay_show_tts_status: true,
+            overlay_show_twitch_status: true,
+            overlay_layout: DEFAULT_LAYOUT,
+            overlay_resolution: '1080p',
+            status_labels: {},
+            tts_status: 'IDLE',
+            twitch_state: 'offline',
+            twitch_username: '',
+        };
+
+        let baseResolution = RESOLUTIONS['1080p'];
+
+        function applyScale(scalePercent) {
+            if (!scalePercent) return;
+            const factor = scalePercent / 100;
+            document.documentElement.style.setProperty('--scale-factor', factor);
+        }
+
+        function setStageResolution(resolutionKey) {
+            baseResolution = RESOLUTIONS[resolutionKey] || RESOLUTIONS['1080p'];
+            if (!overlayStage) return;
+            overlayStage.style.width = `${baseResolution.width}px`;
+            overlayStage.style.height = `${baseResolution.height}px`;
+            syncStageScale();
+        }
+
+        function syncStageScale() {
+            if (!overlayStage || !baseResolution) return;
+            const width = window.innerWidth || 0;
+            const height = window.innerHeight || 0;
+            if (!width || !height) return;
+
+            const scale = Math.min(width / baseResolution.width, height / baseResolution.height);
+            const offsetX = Math.max(0, (width - baseResolution.width * scale) / 2);
+            const offsetY = Math.max(0, (height - baseResolution.height * scale) / 2);
+
+            overlayStage.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+        }
+
+        function setOverlayEnabled(nextEnabled) {
+            overlayEnabled = Boolean(nextEnabled);
+            if (overlayRoot) {
+                overlayRoot.classList.toggle('overlay-hidden', !overlayEnabled);
+            }
+
+            if (!overlayEnabled) {
+                stopEventPolling();
+            } else {
+                startEventPolling();
+            }
+        }
+
+        function applyLayout(layout) {
+            if (!layout || !baseResolution) return;
+            const normalized = normalizeOverlayLayout(layout);
+            applyElementLayout(statusTts, normalized.status_tts);
+            applyElementLayout(statusTwitch, normalized.status_twitch);
+        }
+
+        function applyVisibility(config) {
+            const fallbackShowStatus = config.overlay_show_status !== false;
+            const showTtsStatus = config.overlay_show_tts_status !== undefined
+                ? config.overlay_show_tts_status !== false
+                : fallbackShowStatus;
+            const showTwitchStatus = config.overlay_show_twitch_status !== undefined
+                ? config.overlay_show_twitch_status !== false
+                : fallbackShowStatus;
+
+            if (statusTts) {
+                statusTts.style.display = showTtsStatus ? 'inline-flex' : 'none';
+            }
+            if (statusTwitch) {
+                statusTwitch.style.display = showTwitchStatus ? 'inline-flex' : 'none';
+            }
+        }
+
+        function resolveStatusLabel(key, fallback) {
+            const labels = overlayConfig.status_labels || {};
+            const value = labels[key];
+            return value ? String(value) : fallback;
+        }
+
+        function applyStatus(config) {
+            const ttsStatus = String(config.tts_status || 'IDLE').toUpperCase();
+            const twitchState = String(config.twitch_state || 'offline').toLowerCase();
+            const twitchUsername = String(config.twitch_username || '').trim();
+
+            const ttsLabel = resolveStatusLabel('tts_label', 'TTS');
+            const twitchLabel = resolveStatusLabel('twitch_label', 'TWITCH');
+
+            const ttsStateLabel = ttsStatus === 'PLAYING'
+                ? resolveStatusLabel('status_playing', 'PLAYING')
+                : ttsStatus === 'PAUSED'
+                    ? resolveStatusLabel('status_paused', 'PAUSED')
+                    : resolveStatusLabel('status_idle', 'IDLE');
+
+            const twitchStateLabel = twitchState === 'online'
+                ? resolveStatusLabel('status_online', 'ONLINE')
+                : twitchState === 'connecting'
+                    ? resolveStatusLabel('status_connecting', 'CONNECTING...')
+                    : resolveStatusLabel('status_offline', 'OFFLINE');
+
+            if (statusTtsLabel) {
+                statusTtsLabel.textContent = `${ttsLabel}: ${ttsStateLabel}`;
+            }
+            if (statusTtsDot) {
+                statusTtsDot.className = 'status-dot';
+                if (ttsStatus === 'PLAYING') {
+                    statusTtsDot.classList.add('is-online');
+                } else if (ttsStatus === 'PAUSED') {
+                    statusTtsDot.classList.add('is-paused');
+                }
+            }
+
+            if (statusTwitchLabel) {
+                const suffix = twitchUsername ? ` • ${twitchUsername.toUpperCase()}` : '';
+                statusTwitchLabel.textContent = `${twitchLabel}: ${twitchStateLabel}${suffix}`;
+            }
+            if (statusTwitchDot) {
+                statusTwitchDot.className = 'status-dot';
+                if (twitchState === 'online') {
+                    statusTwitchDot.classList.add('is-online');
+                } else if (twitchState === 'connecting') {
+                    statusTwitchDot.classList.add('is-connecting');
+                }
+            }
+        }
+
+        function mergeConfigPatch(patch) {
+            if (!patch || typeof patch !== 'object') return;
+            const hasOwn = (key) => Object.prototype.hasOwnProperty.call(patch, key);
+            const needsLayoutUpdate = hasOwn('overlay_layout')
+                || hasOwn('overlay_show_status')
+                || hasOwn('overlay_show_tts_status')
+                || hasOwn('overlay_show_twitch_status')
+                || hasOwn('overlay_resolution');
+
+            overlayConfig = {
+                ...overlayConfig,
+                ...patch,
+                overlay_show_chat: false,
+            };
+
+            const resolvedShowTts = overlayConfig.overlay_show_tts_status !== undefined
+                ? overlayConfig.overlay_show_tts_status !== false
+                : overlayConfig.overlay_show_status !== false;
+            const resolvedShowTwitch = overlayConfig.overlay_show_twitch_status !== undefined
+                ? overlayConfig.overlay_show_twitch_status !== false
+                : overlayConfig.overlay_show_status !== false;
+
+            overlayConfig.overlay_show_tts_status = Boolean(resolvedShowTts);
+            overlayConfig.overlay_show_twitch_status = Boolean(resolvedShowTwitch);
+            overlayConfig.overlay_show_status = Boolean(resolvedShowTts || resolvedShowTwitch);
+
+            if (patch.overlay_layout) {
+                overlayConfig.overlay_layout = normalizeOverlayLayout(patch.overlay_layout);
+            }
+            if (patch.status_labels) {
+                overlayConfig.status_labels = patch.status_labels;
+            }
+
+            applyColors(overlayConfig);
+            applyVisibility(overlayConfig);
+            if (needsLayoutUpdate) {
+                applyLayout(overlayConfig.overlay_layout || DEFAULT_LAYOUT);
+            }
+            applyStatus(overlayConfig);
+            if (patch.overlay_resolution) {
+                setStageResolution(String(patch.overlay_resolution));
+            }
+        }
+
+        function clampPercent(value, fallback) {
+            const numericValue = Number.parseFloat(String(value));
+            if (!Number.isFinite(numericValue)) return fallback;
+            return Math.max(0, Math.min(100, numericValue));
+        }
+
+        function clampScale(value, fallback) {
+            const numericValue = Number.parseFloat(String(value));
+            if (!Number.isFinite(numericValue)) return fallback;
+            return Math.max(0.5, Math.min(2, numericValue));
+        }
+
+        function normalizeOverlayLayout(layout) {
+            const rawLayout = layout && typeof layout === 'object' ? layout : {};
+            const rawChat = rawLayout.chat && typeof rawLayout.chat === 'object' ? rawLayout.chat : {};
+            const rawLegacyStatus = rawLayout.status && typeof rawLayout.status === 'object' ? rawLayout.status : {};
+            const rawStatusTts = rawLayout.status_tts && typeof rawLayout.status_tts === 'object'
+                ? rawLayout.status_tts
+                : rawLegacyStatus;
+            const rawStatusTwitch = rawLayout.status_twitch && typeof rawLayout.status_twitch === 'object'
+                ? rawLayout.status_twitch
+                : rawLegacyStatus;
+
+            return {
+                chat: {
+                    x: clampPercent(rawChat.x, DEFAULT_LAYOUT.chat.x),
+                    y: clampPercent(rawChat.y, DEFAULT_LAYOUT.chat.y),
+                    scale: clampScale(rawChat.scale, DEFAULT_LAYOUT.chat.scale),
+                },
+                status_tts: {
+                    x: clampPercent(rawStatusTts.x, DEFAULT_LAYOUT.status_tts.x),
+                    y: clampPercent(rawStatusTts.y, DEFAULT_LAYOUT.status_tts.y),
+                    scale: clampScale(rawStatusTts.scale, DEFAULT_LAYOUT.status_tts.scale),
+                },
+                status_twitch: {
+                    x: clampPercent(rawStatusTwitch.x, DEFAULT_LAYOUT.status_twitch.x),
+                    y: clampPercent(rawStatusTwitch.y, DEFAULT_LAYOUT.status_twitch.y),
+                    scale: clampScale(rawStatusTwitch.scale, DEFAULT_LAYOUT.status_twitch.scale),
+                },
+            };
+        }
+
+        function applyElementLayout(element, layoutItem) {
+            if (!element || !baseResolution) return;
+            const scale = clampScale(layoutItem.scale, 1);
+            element.style.transformOrigin = 'top left';
+            element.style.transform = `scale(${scale})`;
+
+            const percentX = clampPercent(layoutItem.x, 0);
+            const percentY = clampPercent(layoutItem.y, 0);
+
+            element.style.bottom = 'auto';
+            element.style.left = `${percentX}%`;
+            element.style.top = `${percentY}%`;
+        }
+
+        // --- SZÍNKEZELÉS (AetherStream kompatibilis) ---
+        function applyColors(data) {
+            // A te programod a 'setAccent' függvényt használja két paraméterrel.
+            // A JSON-ben valószínűleg accent_primary és accent_secondary néven jönnek.
+            // De figyeljük a 'color' mezőt is biztos ami biztos.
+
+            const primary = data.accent_primary || data.accentColor || data.color || data.highlightColor;
+            const secondary = data.accent_secondary || data.accentColor2 || primary; // Ha nincs második, legyen az első
+
+            if (primary) {
+                document.documentElement.style.setProperty('--accent-primary', primary);
+            }
+            if (secondary) {
+                document.documentElement.style.setProperty('--accent-secondary', secondary);
+            }
+        }
+
+        function handleEventMessage(msg) {
+            if (!msg || typeof msg !== 'object') return;
+
+            // --- 1. TTS START ÜZENET ---
+            if (msg.type === 'TTS_START') {
+                if (!overlayEnabled) {
+                    return;
+                }
+                const data = msg.payload || {};
+
+                if (data.overlayScale || data.scale) {
+                    applyScale(data.overlayScale || data.scale);
+                }
+
+                applyColors(data);
+                return;
+            }
+
+            // --- 2. KONFIG FRISSÍTÉS ---
+            if (msg.type === 'CONFIG_UPDATE' && msg.payload) {
+                mergeConfigPatch(msg.payload);
+                return;
+            }
+
+            // --- 3. MÉRETEZÉS ---
+            if (msg.type === 'SCALE_UPDATE' && msg.payload) {
+                applyScale(msg.payload.scale);
+            }
+        }
+
+        async function syncState() {
+            try {
+                const response = await fetch(`/state${tokenQueryPrefix}`, { cache: 'no-store' });
+                if (!response.ok) return false;
+
+                const payload = await response.json();
+                if (!payload || payload.success !== true) return false;
+
+                if (payload.config) {
+                    mergeConfigPatch(payload.config);
+                }
+
+                if (payload.scale) {
+                    applyScale(payload.scale);
+                }
+
+                const latest = Number(payload.latest_event_id || 0);
+                if (Number.isFinite(latest)) {
+                    const shouldSyncEvents = !hasInitialSync || !pollingTimer || latest < lastEventId;
+                    if (shouldSyncEvents) {
+                        lastEventId = Math.max(lastEventId, latest);
+                    }
+                }
+                hasInitialSync = true;
+
+                setOverlayEnabled(payload.enabled !== false);
+                return true;
+            } catch {
+                return false;
+            }
+        }
+
+        async function pollEvents() {
+            try {
+                const response = await fetch(`/events?since=${lastEventId}${tokenQuerySuffix}`, { cache: 'no-store' });
+                if (!response.ok) return;
+
+                const payload = await response.json();
+                if (!payload || payload.success !== true) return;
+
+                const events = Array.isArray(payload.events) ? payload.events : [];
+                events.forEach((eventItem) => {
+                    handleEventMessage(eventItem);
+                });
+
+                const latest = Number(payload.latest_event_id || 0);
+                if (Number.isFinite(latest)) {
+                    lastEventId = Math.max(lastEventId, latest);
+                }
+            } catch {
+                // no-op
+            }
+        }
+
+        function stopEventPolling() {
+            if (!pollingTimer) return;
+            clearInterval(pollingTimer);
+            pollingTimer = null;
+        }
+
+        async function startEventPolling() {
+            if (pollingTimer || !overlayEnabled) return;
+            pollingTimer = setInterval(() => {
+                void pollEvents();
+            }, POLLING_INTERVAL_MS);
+
+            void pollEvents();
+        }
+
+        function startStatePolling() {
+            if (stateTimer) return;
+            stateTimer = setInterval(() => {
+                void syncState();
+            }, STATE_POLL_INTERVAL_MS);
+        }
+
+        setStageResolution(overlayConfig.overlay_resolution);
+        applyLayout(overlayConfig.overlay_layout);
+        applyVisibility(overlayConfig);
+        applyStatus(overlayConfig);
+        syncStageScale();
+        window.addEventListener('resize', syncStageScale);
+        if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(() => {
+                applyLayout(overlayConfig.overlay_layout || DEFAULT_LAYOUT);
+            });
+        }
+
+        async function initOverlay() {
+            const synced = await syncState();
+            if (!synced) {
+                setOverlayEnabled(true);
+            }
+            startStatePolling();
+        }
+
+        void initOverlay();
+    </script>
+</body>
+</html>
