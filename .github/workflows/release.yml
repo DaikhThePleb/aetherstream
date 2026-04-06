@@ -77,7 +77,6 @@ jobs:
           TWITCH_CLIENT_ID_SECRET: ${{ secrets.VITE_TWITCH_CLIENT_ID }}
           REPO_OWNER_VAR: ${{ vars.VITE_GITHUB_REPO_OWNER }}
           REPO_NAME_VAR: ${{ vars.VITE_GITHUB_REPO_NAME }}
-          UPDATE_TOKEN_SECRET: ${{ secrets.AETHER_GITHUB_TOKEN }}
         run: |
           TWITCH_CLIENT_ID="${TWITCH_CLIENT_ID_VAR:-$TWITCH_CLIENT_ID_SECRET}"
           if [ -z "$TWITCH_CLIENT_ID" ]; then
@@ -92,12 +91,6 @@ jobs:
           echo "VITE_TWITCH_CLIENT_ID=$TWITCH_CLIENT_ID" >> "$GITHUB_ENV"
           echo "VITE_GITHUB_REPO_OWNER=$REPO_OWNER" >> "$GITHUB_ENV"
           echo "VITE_GITHUB_REPO_NAME=$REPO_NAME" >> "$GITHUB_ENV"
-
-          if [ -n "$UPDATE_TOKEN_SECRET" ]; then
-            echo "AETHER_GITHUB_TOKEN=$UPDATE_TOKEN_SECRET" >> "$GITHUB_ENV"
-          else
-            echo "::warning::AETHER_GITHUB_TOKEN is not set. In-app updates will fail if the release repository is private."
-          fi
 
       - name: Validate version consistency
         shell: bash

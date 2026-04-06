@@ -155,8 +155,8 @@ fn env_file_value(key: &str) -> Option<String> {
 }
 
 fn github_auth_token() -> Option<String> {
-    env_or_compile_time("AETHER_GITHUB_TOKEN", option_env!("AETHER_GITHUB_TOKEN"))
-        .or_else(|| env_or_compile_time("VITE_GITHUB_TOKEN", option_env!("VITE_GITHUB_TOKEN")))
+    env_or_compile_time("AETHER_GITHUB_TOKEN", None)
+        .or_else(|| env_or_compile_time("VITE_GITHUB_TOKEN", None))
         .or_else(|| env_file_value("AETHER_GITHUB_TOKEN"))
         .or_else(|| env_file_value("VITE_GITHUB_TOKEN"))
 }
