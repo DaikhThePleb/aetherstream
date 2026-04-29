@@ -38,6 +38,8 @@ export function LoaderOverlay({
     if (!show || error) return undefined
 
     if (!safeCaptions.length) {
+      // safe to set empty caption when there are no captions
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setActiveCaption('')
       return undefined
     }
@@ -147,7 +149,6 @@ export function SetupOverlays({
   t,
   showLanguageSetup = false,
   showAzureSetup = false,
-  showOnboarding = false,
   setupKey = '',
   setupRegion = 'westeurope',
   setupError = '',
@@ -155,12 +156,13 @@ export function SetupOverlays({
   onSetupKeyChange,
   onSetupRegionChange,
   onSubmitSetup,
-  onOnboardingDone,
 }) {
   const [showSetupKey, setShowSetupKey] = useState(false)
 
   useEffect(() => {
     if (showAzureSetup) return
+    // intentionally reset visibility when azure setup is hidden
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setShowSetupKey(false)
   }, [showAzureSetup])
 
@@ -241,33 +243,6 @@ export function SetupOverlays({
         </div>
       </div>
 
-      <div id="onboarding-setup" className={`overlay-mask ${showOnboarding ? 'modal-active' : 'hidden-overlay'}`}>
-        <div className="max-w-md w-full p-8 card border-2 shadow-2xl text-left backdrop-blur-xl">
-          <h2 className="text-2xl font-bold text-white mb-2">{t('onboarding_title')}</h2>
-          <p className="mb-4 text-sm opacity-70">{t('onboarding_desc')}</p>
-          <div className="space-y-2 text-sm text-gray-300">
-            <div className="flex items-start gap-2">
-              <span className="font-bold">1.</span>
-              <span>{t('onboarding_step_1')}</span>
-            </div>
-            <div className="flex items-start gap-2">
-              <span className="font-bold">2.</span>
-              <span>{t('onboarding_step_2')}</span>
-            </div>
-            <div className="flex items-start gap-2">
-              <span className="font-bold">3.</span>
-              <span>{t('onboarding_step_3')}</span>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onOnboardingDone}
-            className="btn-primary w-full py-4 rounded-xl mt-6 text-white uppercase tracking-wider shadow-lg shadow-sky-500/20"
-          >
-            {t('onboarding_done')}
-          </button>
-        </div>
-      </div>
     </>
   )
 }

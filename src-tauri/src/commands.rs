@@ -18,9 +18,16 @@ use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, FilePath};
+use tauri_plugin_global_shortcut::{
+    GlobalShortcutExt,
+    ShortcutEvent,
+    ShortcutState,
+};
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 use url::{form_urlencoded, Url};
 
@@ -28,6 +35,13 @@ const TWITCH_VALIDATE_URL: &str = "https://id.twitch.tv/oauth2/validate";
 const TWITCH_AUTH_URL: &str = "https://id.twitch.tv/oauth2/authorize";
 const TWITCH_OAUTH_PORT: u16 = 1420;
 const OBS_OVERLAY_HTML: &str = include_str!("../../obs-overlay.html");
+const ICON_ICO_DATA: &[u8] = include_bytes!("../icons/icon.ico");
+const TRAY_ICON_ID: &str = "aetherstream-tray";
+const TRAY_MENU_SETTINGS_ID: &str = "tray-settings";
+const TRAY_MENU_EXIT_ID: &str = "tray-exit";
+const EVENT_TRAY_EXIT_REQUEST: &str = "tray-exit-request";
+const EVENT_GLOBAL_HOTKEY_TRIGGERED: &str = "global-hotkey-triggered";
+const EVENT_TTS_PLAYBACK_STARTED: &str = "tts-playback-started";
 const TWITCH_SCOPES: [&str; 6] = [
     "chat:read",
     "chat:edit",
@@ -321,6 +335,341 @@ struct NativeTtsController {
 
 static TTS_PLAYER: OnceLock<NativeTtsController> = OnceLock::new();
 
+#[derive(Clone)]
+struct TrayLabels {
+    settings: String,
+    exit: String,
+}
+
+impl TrayLabels {
+    fn normalized(self) -> Self {
+        let settings = self.settings.trim();
+        let exit = self.exit.trim();
+
+        Self {
+            settings: if settings.is_empty() {
+                "Settings".to_string()
+            } else {
+                settings.to_string()
+            },
+            exit: if exit.is_empty() {
+                "Exit".to_string()
+            } else {
+                exit.to_string()
+            },
+        }
+    }
+}
+
+impl Default for TrayLabels {
+    fn default() -> Self {
+        Self {
+            settings: "Settings".to_string(),
+            exit: "Exit".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RuntimePreferences {
+    tray_enabled: bool,
+    allow_window_close: bool,
+    tray_labels: TrayLabels,
+}
+
+impl Default for RuntimePreferences {
+    fn default() -> Self {
+        Self {
+            tray_enabled: false,
+            allow_window_close: false,
+            tray_labels: TrayLabels::default(),
+        }
+    }
+}
+
+static RUNTIME_PREFERENCES: OnceLock<Mutex<RuntimePreferences>> = OnceLock::new();
+
+fn runtime_preferences() -> &'static Mutex<RuntimePreferences> {
+    RUNTIME_PREFERENCES.get_or_init(|| Mutex::new(RuntimePreferences::default()))
+}
+
+fn tray_labels_for_language(language: &str) -> TrayLabels {
+    match language.trim().to_lowercase().as_str() {
+        "hu" => TrayLabels {
+            settings: "Beállítások".to_string(),
+            exit: "Kilépés".to_string(),
+        },
+        "de" => TrayLabels {
+            settings: "Einstellungen".to_string(),
+            exit: "Beenden".to_string(),
+        },
+        "es" => TrayLabels {
+            settings: "Configuración".to_string(),
+            exit: "Salir".to_string(),
+        },
+        "fr" => TrayLabels {
+            settings: "Paramètres".to_string(),
+            exit: "Quitter".to_string(),
+        },
+        _ => TrayLabels::default(),
+    }
+}
+
+fn parse_tray_labels(labels: &Value, fallback: &TrayLabels) -> TrayLabels {
+    let object = labels.as_object();
+
+    let settings = object
+        .and_then(|entry| entry.get("settings").or_else(|| entry.get("tray_settings")))
+        .and_then(|value| value.as_str())
+        .unwrap_or(&fallback.settings)
+        .to_string();
+
+    let exit = object
+        .and_then(|entry| entry.get("exit").or_else(|| entry.get("tray_exit")))
+        .and_then(|value| value.as_str())
+        .unwrap_or(&fallback.exit)
+        .to_string();
+
+    TrayLabels { settings, exit }.normalized()
+}
+
+fn build_tray_menu(app: &AppHandle, labels: &TrayLabels) -> Result<Menu<tauri::Wry>, String> {
+    let menu = Menu::new(app).map_err(|error| format!("tray_menu_new_failed: {error}"))?;
+
+    let settings_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_SETTINGS_ID,
+        &labels.settings,
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| format!("tray_menu_settings_item_failed: {error}"))?;
+
+    let exit_item = MenuItem::with_id(
+        app,
+        TRAY_MENU_EXIT_ID,
+        &labels.exit,
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| format!("tray_menu_exit_item_failed: {error}"))?;
+
+    menu
+        .append(&settings_item)
+        .map_err(|error| format!("tray_menu_append_settings_failed: {error}"))?;
+    menu
+        .append(&exit_item)
+        .map_err(|error| format!("tray_menu_append_exit_failed: {error}"))?;
+
+    Ok(menu)
+}
+
+fn show_main_window(app: &AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Err("main_window_missing".to_string());
+    };
+
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+
+    Ok(())
+}
+
+fn ensure_tray_icon(app: &AppHandle, labels: &TrayLabels) -> Result<(), String> {
+    let menu = build_tray_menu(app, labels)?;
+
+    if let Some(existing) = app.tray_by_id(TRAY_ICON_ID) {
+        existing
+            .set_menu(Some(menu))
+            .map_err(|error| format!("tray_menu_update_failed: {error}"))?;
+
+        if let Some(icon) = app.default_window_icon() {
+            let _ = existing.set_icon(Some(icon.clone()));
+        }
+
+        return Ok(());
+    }
+
+    let mut builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app_handle, event| {
+            let menu_id = event.id();
+
+            if menu_id == TRAY_MENU_SETTINGS_ID {
+                let _ = show_main_window(app_handle);
+                return;
+            }
+
+            if menu_id == TRAY_MENU_EXIT_ID {
+                let _ = show_main_window(app_handle);
+                let _ = app_handle.emit(EVENT_TRAY_EXIT_REQUEST, json!({}));
+            }
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
+                let _ = show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+
+    builder
+        .build(app)
+        .map_err(|error| format!("tray_build_failed: {error}"))?;
+
+    Ok(())
+}
+
+fn disable_tray_icon(app: &AppHandle) {
+    let _ = app.remove_tray_by_id(TRAY_ICON_ID);
+}
+
+pub fn send_to_tray_runtime(app: &AppHandle) -> Result<(), String> {
+    let (tray_enabled, labels) = runtime_preferences()
+        .lock()
+        .map(|state| (state.tray_enabled, state.tray_labels.clone()))
+        .unwrap_or((false, TrayLabels::default()));
+
+    if !tray_enabled {
+        return Err("tray_disabled".to_string());
+    }
+
+    ensure_tray_icon(app, &labels)?;
+
+    let Some(window) = app.get_webview_window("main") else {
+        return Err("main_window_missing".to_string());
+    };
+
+    window
+        .hide()
+        .map_err(|error| format!("tray_hide_window_failed: {error}"))
+}
+
+fn parse_hotkey_actions(value: &Value) -> Vec<(String, String)> {
+    let mut output = Vec::new();
+
+    let source = value.as_object();
+    for key in ["toggle_pause", "skip", "clear", "test_tts"] {
+        let shortcut = source
+            .and_then(|entry| entry.get(key))
+            .and_then(|entry| entry.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        if shortcut.is_empty() {
+            continue;
+        }
+
+        output.push((key.to_string(), shortcut));
+    }
+
+    output
+}
+
+fn apply_global_hotkeys_from_value(app: &AppHandle, value: &Value) -> Value {
+    let manager = app.global_shortcut();
+    let mut failures: Vec<Value> = Vec::new();
+    let mut registered: Vec<Value> = Vec::new();
+
+    if let Err(error) = manager.unregister_all() {
+        eprintln!("[global-shortcut] unregister_all failed: {error}");
+    }
+
+    let mut seen_shortcuts: HashSet<String> = HashSet::new();
+    for (action, shortcut) in parse_hotkey_actions(value) {
+        let normalized_shortcut = shortcut.to_lowercase();
+        if seen_shortcuts.contains(&normalized_shortcut) {
+            continue;
+        }
+
+        let action_for_handler = action.clone();
+        match manager.on_shortcut(shortcut.as_str(), move |app_handle, _shortcut, event: ShortcutEvent| {
+            if event.state != ShortcutState::Pressed {
+                return;
+            }
+
+            let _ = app_handle.emit(
+                EVENT_GLOBAL_HOTKEY_TRIGGERED,
+                json!({
+                    "action": action_for_handler,
+                }),
+            );
+        }) {
+            Ok(_) => {
+                seen_shortcuts.insert(normalized_shortcut);
+                registered.push(json!({
+                    "action": action,
+                    "shortcut": shortcut,
+                }));
+            }
+            Err(error) => {
+                failures.push(json!({
+                    "action": action,
+                    "shortcut": shortcut,
+                    "error": error.to_string(),
+                }));
+            }
+        }
+    }
+
+    json!({
+        "success": failures.is_empty(),
+        "registered": registered,
+        "failed": failures,
+    })
+}
+
+pub fn should_minimize_to_tray_on_close() -> bool {
+    runtime_preferences()
+        .lock()
+        .map(|state| state.tray_enabled)
+        .unwrap_or(false)
+}
+
+pub fn consume_allow_window_close() -> bool {
+    if let Ok(mut state) = runtime_preferences().lock() {
+        if state.allow_window_close {
+            state.allow_window_close = false;
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn bootstrap_runtime_features(app: &AppHandle) {
+    let config = load_config(app).unwrap_or_else(|_| default_config());
+    let language = config
+        .get("app_lang")
+        .and_then(|value| value.as_str())
+        .unwrap_or("en");
+    let labels = tray_labels_for_language(language);
+    let tray_enabled = config
+        .get("tray_enabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    if let Ok(mut state) = runtime_preferences().lock() {
+        state.tray_enabled = tray_enabled;
+        state.allow_window_close = false;
+        state.tray_labels = labels.clone();
+    }
+
+    disable_tray_icon(app);
+
+    let hotkeys_value = config.get("hotkeys").cloned().unwrap_or_else(|| json!({}));
+    let _ = apply_global_hotkeys_from_value(app, &hotkeys_value);
+}
+
 fn default_config() -> Value {
     json!({
         "azure_key": "",
@@ -329,6 +678,7 @@ fn default_config() -> Value {
         "language_filter": "en-US",
         "volume": 50,
         "audio_device": "default",
+        "read_chat_messages": false,
         "read_emotes": false,
         "twitch_username": "",
         "twitch_user_id": "",
@@ -353,10 +703,19 @@ fn default_config() -> Value {
         "accent_primary": "#00f2ff",
         "accent_secondary": "#a800ff",
         "performance_mode": true,
+        "tray_enabled": false,
         "global_style": "general",
         "global_speed": "1.0",
         "global_pitch": "1.0",
-        "permissionLevel": "everyone",
+        "permissionLevel": "custom",
+        "permission_roles": {
+            "everyone": false,
+            "follower": false,
+            "vip": false,
+            "mod": false,
+            "bot": false,
+            "streamer": false
+        },
         "nameStyle": "always",
         "filter_links": false,
         "trim_repetition": false,
@@ -376,7 +735,19 @@ fn default_config() -> Value {
         "overlay_scale": 100,
         "vts_enabled": false,
         "vts_port": 8001,
-        "vts_auth_token": ""
+        "vts_auth_token": "",
+        "vts_mouth_open_enabled": true,
+        "vts_mouth_open_param": "MouthOpen",
+        "vts_mouth_open_min": 0.0,
+        "vts_mouth_open_max": 1.0,
+        "vts_mouth_smile_enabled": true,
+        "vts_mouth_smile_param": "MouthSmile",
+        "vts_mouth_smile_min": 0.0,
+        "vts_mouth_smile_max": 1.0,
+        "vts_jaw_open_enabled": true,
+        "vts_jaw_open_param": "JawOpen",
+        "vts_jaw_open_min": 0.0,
+        "vts_jaw_open_max": 1.0
     })
 }
 
@@ -1146,6 +1517,16 @@ fn respond_json(request: Request, status_code: u16, payload: Value) {
     let _ = request.respond(response);
 }
 
+fn respond_binary(request: Request, status_code: u16, content_type: &[u8], body: &[u8]) {
+    let mut response = Response::from_data(body.to_vec()).with_status_code(StatusCode(status_code));
+
+    if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], content_type) {
+        response = response.with_header(header);
+    }
+
+    let _ = request.respond(response);
+}
+
 fn push_overlay_event_locked(state: &mut OverlayRuntimeState, event_type: &str, payload: Value) -> u64 {
     state.next_event_id = state.next_event_id.saturating_add(1);
 
@@ -1329,16 +1710,174 @@ fn build_twitch_auth_url(port: u16, state: &str, client_id: &str) -> Result<Stri
     Ok(url.to_string())
 }
 
-fn oauth_status_page(title: &str, message: &str, status: &str) -> String {
-    let status_label = match status {
-        "success" => "Sikeres",
-        "pending" => "Folyamatban",
-        _ => "Hiba",
+fn oauth_theme_palette(theme: &str) -> (&'static str, &'static str, &'static str, &'static str, &'static str, &'static str, &'static str) {
+    match theme {
+        "slate" => ("#0b0f14", "#121822", "#182130", "#212b3a", "#2a384a", "#e6edf7", "#9aa7bd"),
+        "ink" => ("#140f1f", "#1b1529", "#241c36", "#2d2342", "#3b2f58", "#f2eaff", "#b4a1d1"),
+        "green" => ("#0f1511", "#172019", "#1f2a22", "#243529", "#2f4233", "#e6f2ea", "#9bb7a5"),
+        "paper" => ("#f5f6f8", "#ffffff", "#ffffff", "#eef0f3", "#d7dbe1", "#1f2430", "#6b7380"),
+        "warm" => ("#faf3ea", "#fff8f1", "#f6ede1", "#eadcc9", "#ddcbb5", "#3b2a1c", "#7a6654"),
+        "sage" => ("#f1f6f1", "#f9fcf7", "#eaf2e8", "#dde8da", "#c7d5c2", "#213022", "#697a6b"),
+        "glacier" => ("#eef5fb", "#f8fbff", "#e9f1fb", "#dbe7f5", "#c4d3e6", "#1e2a38", "#6b7c92"),
+        _ => ("#0f0f0f", "#121212", "#181818", "#222222", "#282828", "#e0e0e0", "#949ba4"),
+    }
+}
+
+fn oauth_status_page(title: &str, message: &str, status: &str, lang: &str, theme: &str, primary_color: &str, secondary_color: &str) -> String {
+    let icon_data_url = format!("data:image/x-icon;base64,{}", general_purpose::STANDARD.encode(ICON_ICO_DATA));
+    
+    fn translate_text(s: &str, lang: &str) -> String {
+        // Handle a few known Hungarian literals used throughout the file.
+        // Some messages arrive with HTML entities (e.g. "visszautas&iacute;totta"),
+        // so detect by substring and split on the first sentence to preserve the error text.
+        if s.contains("Twitch") && (s.contains("visszautas") || s.contains("visszautas&iacute;")) {
+            let rest = s.splitn(2, ". ").nth(1).unwrap_or("");
+            // Translate a few well-known Twitch error descriptions so users don't see
+            // raw English phrases like "The user denied you access".
+            fn translate_err_desc(desc: &str, lang: &str) -> String {
+                match desc.trim() {
+                    "The user denied you access" => match lang {
+                        "hu" => "A felhasználó megtagadta a hozzáférést.".to_string(),
+                        "de" => "Der Benutzer hat den Zugriff verweigert.".to_string(),
+                        "es" => "El usuario denegó el acceso.".to_string(),
+                        "fr" => "L'utilisateur a refusé l'accès.".to_string(),
+                        _ => desc.to_string(),
+                    },
+                    other => other.to_string(),
+                }
+            }
+
+            let translated_rest = translate_err_desc(rest, lang);
+            return match lang {
+                "hu" => format!("A Twitch visszautas&iacute;totta a bejelentkez&eacute;st. {translated_rest}"),
+                "de" => format!("Twitch hat die Anmeldung abgelehnt. {translated_rest}"),
+                "es" => format!("Twitch rechazó el inicio de sesión. {translated_rest}"),
+                "fr" => format!("Twitch a refusé la connexion. {translated_rest}"),
+                _ => format!("Twitch denied authorization. {translated_rest}"),
+            };
+        }
+
+        match s {
+            "Sikertelen bejelentkez&eacute;s" => match lang {
+                "hu" => "Sikertelen bejelentkez&eacute;s".to_string(),
+                "de" => "Login fehlgeschlagen".to_string(),
+                "es" => "Error de inicio de sesi&oacute;n".to_string(),
+                "fr" => "&Eacute;chec de la connexion".to_string(),
+                _ => "Login failed".to_string(),
+            },
+            "Sikeres bejelentkez&eacute;s" => match lang {
+                "hu" => "Sikeres bejelentkez&eacute;s".to_string(),
+                "de" => "Erfolgreich".to_string(),
+                "es" => "Exitoso".to_string(),
+                "fr" => "Réussi".to_string(),
+                _ => "Successful".to_string(),
+            },
+            "&Eacute;rv&eacute;nytelen &aacute;llapot &eacute;rkezett. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l." => match lang {
+                "hu" => "&Eacute;rv&eacute;nytelen &aacute;llapot &eacute;rkezett. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l.".to_string(),
+                "de" => "Ungültiger Status empfangen. Bitte versuche es erneut in der App.".to_string(),
+                "es" => "Estado inválido recibido. Intenta de nuevo desde la aplicación.".to_string(),
+                "fr" => "État invalide reçu. Veuillez réessayer depuis l'application.".to_string(),
+                _ => "Invalid state received. Please try again from the app.".to_string(),
+            },
+            "Nem &eacute;rkezett token a Twitcht&#245;l. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l." => match lang {
+                "hu" => "Nem &eacute;rkezett token a Twitcht&#245;l. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l.".to_string(),
+                "de" => "Kein Token von Twitch empfangen. Bitte erneut versuchen.".to_string(),
+                "es" => "No se recibió token de Twitch. Intenta de nuevo.".to_string(),
+                "fr" => "Aucun jeton reçu de Twitch. Veuillez réessayer.".to_string(),
+                _ => "No token received from Twitch. Please try again.".to_string(),
+            },
+            "Bejelentkez&eacute;s folyamatban..." => match lang {
+                "hu" => "Bejelentkez&eacute;s folyamatban...".to_string(),
+                "de" => "Login wird verarbeitet...".to_string(),
+                "es" => "Inicio de sesi&oacute;n en progreso...".to_string(),
+                "fr" => "Connexion en cours...".to_string(),
+                _ => "Login in progress...".to_string(),
+            },
+            "Folyamatban" => match lang {
+                "hu" => "Folyamatban".to_string(),
+                "de" => "Lädt...".to_string(),
+                "es" => "Cargando...".to_string(),
+                "fr" => "Chargement...".to_string(),
+                _ => "Pending".to_string(),
+            },
+            "Hiba" => match lang {
+                "hu" => "Hiba".to_string(),
+                "de" => "Fehler".to_string(),
+                "es" => "Error".to_string(),
+                "fr" => "Erreur".to_string(),
+                _ => "Error".to_string(),
+            },
+            "Bezárhatod ezt az ablakot, miután befejeződött." => match lang {
+                "hu" => "Bezárhatod ezt az ablakot, miután befejeződött.".to_string(),
+                "de" => "Dieses Fenster kann geschlossen werden.".to_string(),
+                "es" => "Puede cerrar esta ventana.".to_string(),
+                "fr" => "Vous pouvez fermer cette fenêtre.".to_string(),
+                _ => "You can close this window.".to_string(),
+            },
+            "Bezárhatod ezt az ablakot." => match lang {
+                "hu" => "Bezárhatod ezt az ablakot.".to_string(),
+                "de" => "Dieses Fenster kann geschlossen werden.".to_string(),
+                "es" => "Puede cerrar esta ventana.".to_string(),
+                "fr" => "Vous pouvez fermer cette fenêtre.".to_string(),
+                _ => "You can close this window.".to_string(),
+            },
+            "A Twitch bejelentkez&eacute;s siker&uuml;lt. Visszat&eacute;rhetsz az alkalmaz&aacute;shoz." => match lang {
+                "hu" => "A Twitch bejelentkez&eacute;s siker&uuml;lt. Visszat&eacute;rhetsz az alkalmaz&aacute;shoz.".to_string(),
+                "de" => "Twitch-Anmeldung erfolgreich. Sie können zur App zurückkehren.".to_string(),
+                "es" => "Inicio de sesión de Twitch exitoso. Puedes volver a la aplicación.".to_string(),
+                "fr" => "Connexion Twitch réussie. Vous pouvez revenir à l'application.".to_string(),
+                _ => "Twitch login successful. You can return to the app.".to_string(),
+            },
+            other => other.to_string(),
+        }
+    }
+
+    let status_label = match (status, lang) {
+        ("success", "hu") => "Sikeres",
+        ("success", "de") => "Erfolgreich",
+        ("success", "es") => "Exitoso",
+        ("success", "fr") => "Réussi",
+        ("success", _) => "Successful",
+        ("pending", "hu") => "Folyamatban",
+        ("pending", "de") => "Lädt...",
+        ("pending", "es") => "Cargando...",
+        ("pending", "fr") => "En cours...",
+        ("pending", _) => "Pending",
+        (_, "hu") => "Hiba",
+        (_, "de") => "Fehler",
+        (_, "es") => "Error",
+        (_, "fr") => "Erreur",
+        _ => "Error",
     };
+    
+    let close_text = match lang {
+        "hu" => "Bezárhatod ezt az ablakot.",
+        "de" => "Dieses Fenster kann geschlossen werden.",
+        "es" => "Puede cerrar esta ventana.",
+        "fr" => "Vous pouvez fermer cette fenêtre.",
+        _ => "You can close this window.",
+    };
+
+    let (bg_dark, bg_panel, bg_card, bg_input, border_color, text_main, text_muted) = oauth_theme_palette(theme);
+    let theme_css = format!(
+        r#"
+            --bg-dark: {bg_dark};
+            --bg-panel: {bg_panel};
+            --bg-card: {bg_card};
+            --bg-input: {bg_input};
+            --border-color: {border_color};
+            --text-main: {text_main};
+            --text-muted: {text_muted};
+        "#
+    );
+
+    // Translate passed-in title/message if they were hardcoded in Hungarian
+    let title = translate_text(title, lang);
+    let message = translate_text(message, lang);
 
     format!(
         r#"<!doctype html>
-<html lang="hu">
+<html lang="{lang}">
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -1346,16 +1885,10 @@ fn oauth_status_page(title: &str, message: &str, status: &str) -> String {
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
         :root {{
-            --bg-dark: #0f0f0f;
-            --bg-panel: #121212;
-            --bg-card: #181818;
-            --bg-input: #222222;
-            --border-color: #282828;
-            --accent-primary: #00b4ff;
-            --accent-secondary: #8000ff;
+            {theme_css}
+            --accent-primary: {primary_color};
+            --accent-secondary: {secondary_color};
             --brand-gradient: linear-gradient(135deg, var(--accent-primary) 0%, var(--accent-secondary) 100%);
-            --text-main: #e0e0e0;
-            --text-muted: #949ba4;
         }}
         * {{ box-sizing: border-box; }}
         body {{
@@ -1389,8 +1922,8 @@ fn oauth_status_page(title: &str, message: &str, status: &str) -> String {
         .brand-mark {{
             width: 28px;
             height: 28px;
-            border-radius: 10px;
-            background: var(--brand-gradient);
+            border-radius: 8px;
+            object-fit: cover;
             box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
         }}
         .brand-name {{
@@ -1440,30 +1973,102 @@ fn oauth_status_page(title: &str, message: &str, status: &str) -> String {
     <div class="page">
         <div class="card">
             <div class="brand">
-                <div class="brand-mark"></div>
+                <img class="brand-mark" src="{icon_data_url}" alt="AetherStream" />
                 <div class="brand-name">Aether<span>Stream</span></div>
             </div>
             <div class="status-pill {status}">{status_label}</div>
             <h1>{title}</h1>
             <p>{message}</p>
-            <p class="hint">Bez&aacute;rhatod ezt az ablakot.</p>
+            <p class="hint">{close_text}</p>
         </div>
     </div>
 </body>
 </html>"#,
+        theme_css = theme_css,
+        lang = lang,
+        primary_color = primary_color,
+        secondary_color = secondary_color,
         status = status,
         status_label = status_label,
         title = title,
-        message = message
+        message = message,
+        close_text = close_text,
+        icon_data_url = icon_data_url,
     )
 }
 
-fn oauth_callback_page() -> String {
-    let title = "Bejelentkez&eacute;s folyamatban...";
-    let message = "Egy pillanat, &aacute;tir&aacute;ny&iacute;tunk a tokenhez.";
+fn oauth_callback_page(lang: &str, theme: &str, primary_color: &str, secondary_color: &str) -> String {
+    let icon_data_url = format!("data:image/x-icon;base64,{}", general_purpose::STANDARD.encode(ICON_ICO_DATA));
+    
+    let (title, message, loading_text, error_title, error_message, error_label, pending_label, close_text) = match lang {
+        "hu" => (
+            "Bejelentkez&eacute;s folyamatban...",
+            "Egy pillanat, &aacute;tir&aacute;ny&iacute;tunk a tokenhez.",
+            "Folyamatban",
+            "Sikertelen bejelentkez&eacute;s",
+            "Nem kaptunk tokent a Twitcht&#337;l. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l.",
+            "Hiba",
+            "Folyamatban",
+            "Bezárhatod ezt az ablakot, miután befejeződött.",
+        ),
+        "de" => (
+            "Login wird verarbeitet...",
+            "Einen Moment, wir leiten Sie weiter.",
+            "Lädt...",
+            "Login fehlgeschlagen",
+            "Kein Token von Twitch empfangen. Bitte erneut versuchen.",
+            "Fehler",
+            "Lädt...",
+            "Dieses Fenster kann geschlossen werden.",
+        ),
+        "es" => (
+            "Inicio de sesi&oacute;n en progreso...",
+            "Un momento, te redirigimos.",
+            "Cargando...",
+            "Error de inicio de sesi&oacute;n",
+            "No se recibió token de Twitch. Intenta de nuevo.",
+            "Error",
+            "Cargando...",
+            "Puede cerrar esta ventana.",
+        ),
+        "fr" => (
+            "Connexion en cours...",
+            "Un instant, nous vous r&eacute;acheminons.",
+            "Chargement...",
+            "&Eacute;chec de la connexion",
+            "Aucun jeton reçu de Twitch. Veuillez réessayer.",
+            "Erreur",
+            "Chargement...",
+            "Vous pouvez fermer cette fenêtre.",
+        ),
+        _ => (
+            "Login in progress...",
+            "One moment, redirecting you.",
+            "Pending",
+            "Login failed",
+            "No token received from Twitch. Please try again.",
+            "Error",
+            "Pending",
+            "You can close this window.",
+        ),
+    };
+
+    let (bg_dark, bg_panel, bg_card, bg_input, border_color, text_main, text_muted) = oauth_theme_palette(theme);
+    let theme_css = format!(
+        r#"
+            --bg-dark: {bg_dark};
+            --bg-panel: {bg_panel};
+            --bg-card: {bg_card};
+            --bg-input: {bg_input};
+            --border-color: {border_color};
+            --text-main: {text_main};
+            --text-muted: {text_muted};
+        "#
+    );
+
     format!(
         r#"<!doctype html>
-<html lang="hu">
+<html lang="{lang}">
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -1471,16 +2076,10 @@ fn oauth_callback_page() -> String {
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
         :root {{
-            --bg-dark: #0f0f0f;
-            --bg-panel: #121212;
-            --bg-card: #181818;
-            --bg-input: #222222;
-            --border-color: #282828;
-            --accent-primary: #00b4ff;
-            --accent-secondary: #8000ff;
+            {theme_css}
+            --accent-primary: {primary_color};
+            --accent-secondary: {secondary_color};
             --brand-gradient: linear-gradient(135deg, var(--accent-primary) 0%, var(--accent-secondary) 100%);
-            --text-main: #e0e0e0;
-            --text-muted: #949ba4;
         }}
         * {{ box-sizing: border-box; }}
         body {{
@@ -1514,8 +2113,8 @@ fn oauth_callback_page() -> String {
         .brand-mark {{
             width: 28px;
             height: 28px;
-            border-radius: 10px;
-            background: var(--brand-gradient);
+            border-radius: 8px;
+            object-fit: cover;
             box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35);
         }}
         .brand-name {{
@@ -1565,23 +2164,25 @@ fn oauth_callback_page() -> String {
     <div class="page">
         <div class="card">
             <div class="brand">
-                <div class="brand-mark"></div>
+                <img class="brand-mark" src="{icon_data_url}" alt="AetherStream" />
                 <div class="brand-name">Aether<span>Stream</span></div>
             </div>
-            <div class="status-pill pending" id="status-pill">Folyamatban</div>
+            <div class="status-pill pending" id="status-pill">{loading_text}</div>
             <h1 id="status-title">{title}</h1>
             <p id="status-message">{message}</p>
-            <p class="hint">Bez&aacute;rhatod ezt az ablakot, miut&aacute;n befejez&#337;d&ouml;tt.</p>
+            <p class="hint" id="hint-text">{close_text}</p>
         </div>
     </div>
     <script>
         const statusPill = document.getElementById('status-pill');
         const titleEl = document.getElementById('status-title');
         const messageEl = document.getElementById('status-message');
+        const errorLabel = '{error_label}';
+        const pendingLabel = '{pending_label}';
 
         const setStatus = (state, title, message) => {{
             statusPill.className = 'status-pill ' + state;
-            statusPill.textContent = state === 'error' ? 'Hiba' : 'Folyamatban';
+            statusPill.textContent = state === 'error' ? errorLabel : pendingLabel;
             titleEl.innerHTML = title;
             messageEl.innerHTML = message;
         }};
@@ -1599,17 +2200,28 @@ fn oauth_callback_page() -> String {
         if (hashParams.get('access_token')) {{
             window.location.replace('/token?' + hashParams.toString());
         }} else {{
-            setStatus('error', 'Sikertelen bejelentkez&eacute;s', 'Nem kaptunk tokent a Twitcht&#337;l. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l.');
+            setStatus('error', '{error_title}', '{error_message}');
         }}
     </script>
 </body>
 </html>"#,
+        theme_css = theme_css,
+        lang = lang,
+        primary_color = primary_color,
+        secondary_color = secondary_color,
         title = title,
-        message = message
+        message = message,
+        loading_text = loading_text,
+        error_title = error_title,
+        error_message = error_message,
+        error_label = error_label,
+        pending_label = pending_label,
+        close_text = close_text,
+        icon_data_url = icon_data_url,
     )
 }
 
-fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration) -> Result<String, String> {
+fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration, lang: String, theme: String, primary_color: String, secondary_color: String) -> Result<String, String> {
     let server = Server::http(("127.0.0.1", port))
         .map_err(|e| format!("OAuth callback server failed to start: {e}"))?;
 
@@ -1637,7 +2249,7 @@ fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration) ->
                         .unwrap_or_else(|| "Twitch denied authorization.".to_string());
                     let escaped = err_text.replace('<', "&lt;").replace('>', "&gt;");
                     let message = format!("A Twitch visszautas&iacute;totta a bejelentkez&eacute;st. {escaped}");
-                    let body = oauth_status_page("Sikertelen bejelentkez&eacute;s", &message, "error");
+                    let body = oauth_status_page("Sikertelen bejelentkez&eacute;s", &message, "error", &lang, &theme, &primary_color, &secondary_color);
                     respond_html(request, 400, &body);
                     return Err(format!("twitch_oauth_{error_code}"));
                 }
@@ -1648,6 +2260,10 @@ fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration) ->
                         "Sikertelen bejelentkez&eacute;s",
                         "&Eacute;rv&eacute;nytelen &aacute;llapot &eacute;rkezett. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l.",
                         "error",
+                        &lang,
+                            &theme,
+                            &primary_color,
+                        &secondary_color,
                     );
                     respond_html(request, 401, &body);
                     return Err("oauth_state_mismatch".to_string());
@@ -1655,18 +2271,22 @@ fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration) ->
 
                 let access_token = query_param(query, "access_token").unwrap_or_default();
                 if !access_token.is_empty() {
-                                        let body = oauth_status_page(
-                                                "Sikeres bejelentkez&eacute;s",
-                                                "A Twitch bejelentkez&eacute;s siker&uuml;lt. Visszat&eacute;rhetsz az alkalmaz&aacute;shoz.",
-                                                "success",
-                                        );
+                    let body = oauth_status_page(
+                        "Sikeres bejelentkez&eacute;s",
+                        "A Twitch bejelentkez&eacute;s siker&uuml;lt. Visszat&eacute;rhetsz az alkalmaz&aacute;shoz.",
+                        "success",
+                        &lang,
+                            &theme,
+                        &primary_color,
+                        &secondary_color,
+                    );
                                         respond_html(request, 200, &body);
                     return Ok(format!("oauth:{access_token}"));
                 }
             }
 
-                        let callback_page = oauth_callback_page();
-                        respond_html(request, 200, &callback_page);
+            let callback_page = oauth_callback_page(&lang, &theme, &primary_color, &secondary_color);
+            respond_html(request, 200, &callback_page);
             continue;
         }
 
@@ -1678,7 +2298,7 @@ fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration) ->
                     .unwrap_or_else(|| "Twitch denied authorization.".to_string());
                 let escaped = err_text.replace('<', "&lt;").replace('>', "&gt;");
                 let message = format!("A Twitch visszautas&iacute;totta a bejelentkez&eacute;st. {escaped}");
-                let body = oauth_status_page("Sikertelen bejelentkez&eacute;s", &message, "error");
+                let body = oauth_status_page("Sikertelen bejelentkez&eacute;s", &message, "error", &lang, &theme, &primary_color, &secondary_color);
                 respond_html(request, 400, &body);
                 return Err(format!("twitch_oauth_{error_code}"));
             }
@@ -1689,6 +2309,10 @@ fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration) ->
                     "Sikertelen bejelentkez&eacute;s",
                     "&Eacute;rv&eacute;nytelen &aacute;llapot &eacute;rkezett. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l.",
                     "error",
+                    &lang,
+                        &theme,
+                        &primary_color,
+                    &secondary_color,
                 );
                 respond_html(request, 401, &body);
                 return Err("oauth_state_mismatch".to_string());
@@ -1700,6 +2324,10 @@ fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration) ->
                     "Sikertelen bejelentkez&eacute;s",
                     "Nem &eacute;rkezett token a Twitcht&#245;l. Pr&oacute;b&aacute;ld &uacute;jra az alkalmaz&aacute;sb&oacute;l.",
                     "error",
+                    &lang,
+                        &theme,
+                    &primary_color,
+                    &secondary_color,
                 );
                 respond_html(request, 400, &body);
                 return Err("oauth_token_missing".to_string());
@@ -1709,14 +2337,22 @@ fn receive_twitch_token(port: u16, expected_state: String, timeout: Duration) ->
                 "Sikeres bejelentkez&eacute;s",
                 "A Twitch bejelentkez&eacute;s siker&uuml;lt. Visszat&eacute;rhetsz az alkalmaz&aacute;shoz.",
                 "success",
+                &lang,
+                    &theme,
+                &primary_color,
+                &secondary_color,
             );
             respond_html(request, 200, &body);
             return Ok(format!("oauth:{access_token}"));
         }
 
         if path == "/favicon.ico" {
-            let response = Response::empty(StatusCode(204));
-            let _ = request.respond(response);
+            respond_binary(
+                request,
+                200,
+                &b"image/x-icon"[..],
+                include_bytes!("../icons/icon.ico"),
+            );
             continue;
         }
 
@@ -2477,6 +3113,10 @@ pub async fn exit_application(app: AppHandle) -> Value {
         eprintln!("[exit_application] persist_main_window_state failed: {error}");
     }
 
+    if let Ok(mut state) = runtime_preferences().lock() {
+        state.allow_window_close = true;
+    }
+
     let windows = app.webview_windows();
 
     if windows.is_empty() {
@@ -2498,7 +3138,78 @@ pub async fn exit_application(app: AppHandle) -> Value {
 }
 
 #[tauri::command]
-pub async fn update_tray_lang(_labels: Value) -> bool {
+pub async fn set_global_hotkeys(app: AppHandle, hotkeys: Value) -> Value {
+    apply_global_hotkeys_from_value(&app, &hotkeys)
+}
+
+#[tauri::command]
+pub async fn set_tray_enabled(app: AppHandle, enabled: bool, labels: Value) -> Value {
+    let fallback = runtime_preferences()
+        .lock()
+        .map(|state| state.tray_labels.clone())
+        .unwrap_or_else(|_| TrayLabels::default());
+    let next_labels = parse_tray_labels(&labels, &fallback);
+
+    disable_tray_icon(&app);
+
+    if let Ok(mut state) = runtime_preferences().lock() {
+        state.tray_enabled = enabled;
+        state.tray_labels = next_labels.clone();
+    }
+
+    // If tray mode was just enabled, ensure the tray icon is created immediately
+    if enabled {
+        let _ = ensure_tray_icon(&app, &next_labels);
+    }
+
+    json!({
+        "success": true,
+        "enabled": enabled,
+    })
+}
+
+#[tauri::command]
+pub async fn send_to_tray(app: AppHandle, labels: Option<Value>) -> Value {
+    if let Some(labels_value) = labels {
+        let fallback = runtime_preferences()
+            .lock()
+            .map(|state| state.tray_labels.clone())
+            .unwrap_or_else(|_| TrayLabels::default());
+        let next_labels = parse_tray_labels(&labels_value, &fallback);
+
+        if let Ok(mut state) = runtime_preferences().lock() {
+            state.tray_labels = next_labels;
+        }
+    }
+
+    match send_to_tray_runtime(&app) {
+        Ok(_) => json!({
+            "success": true,
+        }),
+        Err(error) => json!({
+            "success": false,
+            "error": error,
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn update_tray_lang(app: AppHandle, labels: Value) -> bool {
+    let (tray_enabled, fallback_labels) = runtime_preferences()
+        .lock()
+        .map(|state| (state.tray_enabled, state.tray_labels.clone()))
+        .unwrap_or((false, TrayLabels::default()));
+
+    let next_labels = parse_tray_labels(&labels, &fallback_labels);
+
+    if let Ok(mut state) = runtime_preferences().lock() {
+        state.tray_labels = next_labels.clone();
+    }
+
+    if tray_enabled && app.tray_by_id(TRAY_ICON_ID).is_some() {
+        return ensure_tray_icon(&app, &next_labels).is_ok();
+    }
+
     true
 }
 
@@ -2851,6 +3562,12 @@ pub async fn play_tts(app: AppHandle, data: Value) -> Value {
         .and_then(Value::as_str)
         .map(|value| value.to_string())
         .unwrap_or_else(|| string_field(&config, "audio_device", "default"));
+    let request_id = data
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
 
     let ssml = build_ssml(text, voice, style, rate, pitch);
 
@@ -2863,6 +3580,22 @@ pub async fn play_tts(app: AppHandle, data: Value) -> Value {
 
     match response {
         Ok(bytes) => {
+            if !request_id.is_empty() {
+                let started_at_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0);
+
+                let _ = app.emit(
+                    EVENT_TTS_PLAYBACK_STARTED,
+                    json!({
+                        "request_id": request_id,
+                        "started_at": started_at_ms,
+                    }),
+                );
+            }
+
             let playback_device = audio_device.clone();
             let playback_result = tauri::async_runtime::spawn_blocking(move || {
                 play_audio_bytes(bytes, volume, &playback_device)
@@ -2906,7 +3639,7 @@ pub fn tts_clear() -> bool {
 }
 
 #[tauri::command]
-pub async fn twitch_login(client_id: String) -> Value {
+pub async fn twitch_login(client_id: String, lang: String, theme: String, primary_color: String, secondary_color: String) -> Value {
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return json!({ "success": false, "error": "err_twitch_client_id_missing" });
@@ -2932,7 +3665,11 @@ pub async fn twitch_login(client_id: String) -> Value {
 
     let token_future = tauri::async_runtime::spawn_blocking({
         let expected_state = oauth_state.clone();
-        move || receive_twitch_token(port, expected_state, Duration::from_secs(300))
+        let lang_clone = lang.clone();
+        let theme_clone = theme.clone();
+        let primary_color_clone = primary_color.clone();
+        let secondary_color_clone = secondary_color.clone();
+        move || receive_twitch_token(port, expected_state, Duration::from_secs(300), lang_clone, theme_clone, primary_color_clone, secondary_color_clone)
     });
 
     if let Err(error) = webbrowser::open(&auth_url) {

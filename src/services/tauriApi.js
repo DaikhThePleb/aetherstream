@@ -1,4 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
 export const isTauriRuntime = () => {
@@ -52,6 +53,7 @@ export async function getConfig() {
       accent_primary: '#00f2ff',
       accent_secondary: '#a800ff',
       performance_mode: true,
+      tray_enabled: false,
       obs_server_enabled: false,
       overlay_token: '',
       overlay_show_chat: false,
@@ -68,6 +70,18 @@ export async function getConfig() {
       vts_enabled: false,
       vts_port: 8001,
       vts_auth_token: '',
+      vts_mouth_open_enabled: true,
+      vts_mouth_open_param: 'MouthOpen',
+      vts_mouth_open_min: 0,
+      vts_mouth_open_max: 1,
+      vts_mouth_smile_enabled: true,
+      vts_mouth_smile_param: 'MouthSmile',
+      vts_mouth_smile_min: 0,
+      vts_mouth_smile_max: 1,
+      vts_jaw_open_enabled: true,
+      vts_jaw_open_param: 'JawOpen',
+      vts_jaw_open_min: 0,
+      vts_jaw_open_max: 1,
     }
   )
 }
@@ -77,7 +91,7 @@ export async function saveConfig(newConfig) {
 }
 
 export async function getAppVersion() {
-  return (await safeInvoke('get_app_version', {}, '0.1.0')) ?? '0.1.0'
+  return (await safeInvoke('get_app_version', {}, '0.2.0')) ?? '0.2.0'
 }
 
 export async function getLatestGithubRelease(owner, repo) {
@@ -188,10 +202,16 @@ export async function ttsClear() {
   return (await safeInvoke('tts_clear', {}, true)) ?? true
 }
 
-export async function twitchLogin(clientId) {
+export async function twitchLogin(clientId, lang, theme, accentPrimary, accentSecondary) {
   return (await safeInvoke(
     'twitch_login',
-    { clientId: String(clientId || '').trim() },
+    {
+      clientId: String(clientId || '').trim(),
+      lang: String(lang || 'en').trim(),
+      theme: String(theme || 'dark').trim(),
+      primaryColor: String(accentPrimary || '#00b4ff').trim(),
+      secondaryColor: String(accentSecondary || '#a800ff').trim(),
+    },
     { success: false, error: 'interactive_oauth_not_implemented' },
   ))
 }
@@ -284,6 +304,10 @@ export async function minimizeWindow() {
   await withWindow((windowHandle) => windowHandle.minimize())
 }
 
+export async function hideWindow() {
+  await withWindow((windowHandle) => windowHandle.hide())
+}
+
 export async function toggleMaximizeWindow() {
   await withWindow(async (windowHandle) => {
     const isMaximized = await windowHandle.isMaximized()
@@ -301,6 +325,60 @@ export async function closeWindow() {
 
 export async function exitApplication() {
   return (await safeInvoke('exit_application', {}, { success: false }))
+}
+
+export async function setGlobalHotkeys(hotkeys) {
+  return (await safeInvoke(
+    'set_global_hotkeys',
+    { hotkeys },
+    { success: false, failed: [], registered: [] },
+  ))
+}
+
+export async function setTrayEnabled(enabled, labels = {}) {
+  return (await safeInvoke(
+    'set_tray_enabled',
+    {
+      enabled: Boolean(enabled),
+      labels,
+    },
+    { success: false, enabled: false },
+  ))
+}
+
+export async function sendToTray(labels = {}) {
+  return (await safeInvoke(
+    'send_to_tray',
+    {
+      labels,
+    },
+    { success: false },
+  ))
+}
+
+export async function updateTrayLanguage(labels = {}) {
+  return (await safeInvoke('update_tray_lang', { labels }, true)) ?? true
+}
+
+export async function onBackendEvent(eventName, handler) {
+  if (!isTauriRuntime()) return () => {}
+
+  try {
+    const unlisten = await listen(String(eventName || '').trim(), (event) => {
+      handler?.(event?.payload)
+    })
+
+    return () => {
+      try {
+        unlisten?.()
+      } catch {
+        // ignore unlisten failures
+      }
+    }
+  } catch (error) {
+    console.error(`Failed to subscribe backend event: ${String(eventName || '')}`, error)
+    return () => {}
+  }
 }
 
 export async function onWindowCloseRequested(handler) {

@@ -1,19 +1,20 @@
 # Changelog
 
-## 0.1.0 - 2026-04-06
+## 0.2.0 - 2026-04-29
 
-This is the first public release of AetherStream.
+Updates
+- Minimize-to-tray support for keeping the app out of the way while it runs.
+- VTube Studio integration for live model control.
+- A collapsible sidebar for a cleaner and more flexible layout.
+- New permission types by user role, including Subscriber, VIP, Moderator, and more.
+- A chat reading toggle to enable or disable message reading.
+- An About section with a description, useful links, the developer name, and the license.
 
-Included features:
+Changes
+- Reworked UI wording to sound clearer and more natural.
+- Unified the look and feel across the interface.
+- Removed unnecessary descriptions and extra text from the UI.
 
-- Desktop control app for Twitch text-to-speech workflows.
-- Azure Speech integration with voice, speed, pitch, style, and volume controls.
-- Twitch login and chat message processing.
-- Custom voice rules for Channel Point rewards.
-- Custom voice rules for specific users.
-- Queue controls: pause, resume, skip, and clear.
-- Message filters for links, blocked words, and blocked users.
-- OBS overlay support for live status display.
-- Preset save, export, and import support.
-- Multi-language interface support.
-- In-app update check based on GitHub releases.
+Bugfixes
+- Shortcut keys now work even when the app is not focused.
+- Various stability and usability fixes.

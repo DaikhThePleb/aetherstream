@@ -24,3 +24,52 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor/IDE
+/.vscode/*
+.history
+
+# Node / build
+/dist/
+/build/
+/out/
+.vite/
+.parcel-cache/
+coverage/
+.nyc_output/
+
+# Tauri / Rust
+/src-tauri/target/
+/target/
+*.rs.bk
+
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.lib
+
+# Archives
+*.zip
+*.tar.gz
+*.tgz
+*.7z
+
+# Certificates / keys / secrets
+*.pem
+*.key
+*.crt
+*.p12
+secrets.json
+.secret
+
+# Misc
+.cache/
+node_modules/

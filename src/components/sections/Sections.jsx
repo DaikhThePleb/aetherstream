@@ -1,28 +1,110 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import {
+  Bot,
   Copy,
   Eye,
+  Gem,
+  Heart,
   Mic,
+  Star,
+  Music,
   Pencil,
   Play,
   RefreshCw,
+  Radio,
   RotateCcw,
+  ShieldCheck,
   Trash2,
   AlertTriangle,
+  ExternalLink,
+  Github,
+  Globe,
   Twitch,
   User,
+  Users,
   X,
 } from 'lucide-react'
+import { SiDiscord } from 'react-icons/si'
 import {
   APP_LANGUAGE_OPTIONS,
   AZURE_REGIONS,
   AZURE_STYLE_IDS,
 } from '../../i18n/translations'
+import LICENSE_TEXT from '../../../LICENSE?raw'
+import { openExternalUrl } from '../../services/tauriApi'
 
 function SectionTitle({ children, danger = false }) {
   return (
     <h2 className={`section-title-main ${danger ? 'text-red-500' : ''}`}>{children}</h2>
+  )
+}
+
+// (refs created inside component)
+
+function LinkCard({ href, title, description, icon: IconComponent, disabled = false }) {
+  const content = (
+    <div className={`link-card flex items-center justify-between gap-4 rounded-2xl border p-4 transition-colors ${disabled ? 'opacity-50' : ''}`} style={{ backgroundColor: 'var(--bg-input)', borderColor: 'var(--border-color)' }}>
+      <div className="min-w-0">
+        <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: 'var(--text-main)' }}>
+          <IconComponent className="w-4 h-4" style={{ color: 'var(--accent-primary)' }} />
+          <span>{title}</span>
+        </div>
+        <p className="mt-1 text-xs text-gray-500">{description}</p>
+      </div>
+      <ExternalLink className="w-4 h-4 shrink-0" style={{ color: 'var(--text-muted)' }} />
+    </div>
+  )
+
+  if (disabled || !href) {
+    return <div>{content}</div>
+  }
+  
+  const handleClick = async (event) => {
+    event.preventDefault()
+    await openExternalUrl(href)
+  }
+
+  const handleKeyDown = async (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      await openExternalUrl(href)
+    }
+  }
+
+  return (
+    <a href={href} onClick={handleClick} onKeyDown={handleKeyDown} role="link" tabIndex={0} className="block cursor-pointer" rel="noreferrer">
+      {content}
+    </a>
+  )
+}
+
+function VtsChannelIcon({ channelKey }) {
+  if (channelKey === 'mouth_smile') {
+    return (
+      <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M5 12c0 4.2 3.1 7 7 7s7-2.8 7-7" />
+        <path d="M6.5 10h11" />
+      </svg>
+    )
+  }
+
+  if (channelKey === 'jaw_open') {
+    return (
+      <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M7 8c0-2.8 2.2-5 5-5s5 2.2 5 5" />
+        <path d="M6 13v2.5c0 3 2.4 5.5 5.5 5.5h1c3.1 0 5.5-2.5 5.5-5.5V13" />
+        <path d="M6 13h12" />
+      </svg>
+    )
+  }
+
+  return (
+    <svg viewBox="0 0 24 24" className="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <ellipse cx="12" cy="12.5" rx="5" ry="7" />
+    </svg>
   )
 }
 
@@ -267,7 +349,8 @@ const formatVoiceSummary = (rule = {}, azureVoices, t) => {
   }
 
   if (savedVoiceLabel) {
-    return `${savedVoiceLabel} • ${speed}x (${t('lbl_speed')}) • ${pitch} (${t('lbl_pitch')}) • ${styleLabel}`
+    const currentVoiceLabel = matched ? (formatVoiceLabel(matched, t) || voiceId) : savedVoiceLabel
+    return `${currentVoiceLabel} • ${speed}x (${t('lbl_speed')}) • ${pitch} (${t('lbl_pitch')}) • ${styleLabel}`
   }
 
   if (!matched) {
@@ -649,7 +732,7 @@ export function TwitchSection({ onConnectTwitch, onDisconnectTwitch, onToggleSen
               </span>
             </button>
           </div>
-          <p className="text-[10px] text-gray-500 mt-2">{t('token_help')}</p>
+          <p className="text-[10px] text-gray-500 mt-1">{t('token_help')}</p>
         </div>
       </section>
     </div>
@@ -878,6 +961,15 @@ export function RewardsSection({
     [rewardRules],
   )
 
+  // Recalculate summaries whenever t changes to ensure language updates
+  const rewardSummaries = useMemo(() => {
+    const summaries = {}
+    Object.entries(rewardRules || {}).forEach(([rewardId, rule]) => {
+      summaries[rewardId] = formatVoiceSummary(rule, azureVoices, t)
+    })
+    return summaries
+  }, [rewardRules, azureVoices, t])
+
   const [_availableRewards, setAvailableRewards] = useState([])
   const [isLoadingRewards, setIsLoadingRewards] = useState(false)
   const [isSavingRule, setIsSavingRule] = useState(false)
@@ -906,8 +998,13 @@ export function RewardsSection({
     [azureVoices, form.langFilter],
   )
 
+  
+
   useEffect(() => {
     if (!isRewardStyleDisabled) return
+    // When style support is disabled we need to coerce the form to a supported style.
+    // This setState is intentional and safe — suppress the specific rule.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setForm((previous) => {
       if (String(previous.style || 'general') === 'general') {
         return previous
@@ -1061,13 +1158,13 @@ export function RewardsSection({
             )}
 
             {rewardEntries.map(([rewardId, rule]) => {
-              const summary = formatVoiceSummary(rule, azureVoices, t)
+              const summary = rewardSummaries[rewardId] || formatVoiceSummary(rule, azureVoices, t)
               const rewardName = rule.rewardName || rule.title || t('new_reward_title')
 
               return (
-                <div key={rewardId} className="card p-4 flex items-center justify-between group transition-all reward-rule-row">
-                  <div className="flex items-center gap-4 overflow-hidden flex-grow">
-                    <div className="p-2 row-icon-bg rounded-lg shadow-sm">
+                <div key={rewardId} className="card p-4 flex items-center justify-between gap-4 group transition-all reward-rule-row">
+                  <div className="flex items-center gap-4 overflow-hidden flex-grow min-w-0">
+                    <div className="p-2 row-icon-bg rounded-lg shadow-sm shrink-0">
                       <Mic className="w-6 h-6" style={{ color: 'var(--accent-primary)' }} />
                     </div>
 
@@ -1179,23 +1276,27 @@ export function RewardsSection({
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div>
                 <label className="label-text text-[10px] opacity-70 mb-1 block">{t('modal_lang_filter')}</label>
-                <select
-                  value={form.langFilter}
-                  onChange={(event) => {
-                    const value = event.currentTarget.value
-                    const supportsStyle = hasStyleSupport(azureVoices, value)
-                    setForm((previous) => ({
-                      ...previous,
-                      langFilter: value,
-                      style: supportsStyle ? previous.style : 'general',
-                    }))
-                  }}
-                  className="w-full p-2 rounded-lg bg-black/50 border border-white/10 text-sm focus:border-sky-500 outline-none"
-                >
-                  {rewardLanguageOptions.map((language) => (
-                    <option key={language} value={language}>{formatLocaleLabel(language, appLang)}</option>
-                  ))}
-                </select>
+                  <select
+                    value={form.langFilter}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value
+                      const supportsStyle = hasStyleSupport(azureVoices, value)
+                      // choose first matching voice for the newly selected language if available
+                      const matching = (azureVoices || []).filter((voice) => String(voice.Locale || '').toLowerCase().startsWith(String(value || '').toLowerCase()))
+                      const chosenVoice = matching.length ? matching[0].ShortName : (form.voice || defaultVoice)
+                      setForm((previous) => ({
+                        ...previous,
+                        langFilter: value,
+                        style: supportsStyle ? previous.style : 'general',
+                        voice: chosenVoice,
+                      }))
+                    }}
+                    className="w-full p-2 rounded-lg bg-black/50 border border-white/10 text-sm focus:border-sky-500 outline-none"
+                  >
+                    {rewardLanguageOptions.map((language) => (
+                      <option key={language} value={language}>{formatLocaleLabel(language, appLang)}</option>
+                    ))}
+                  </select>
               </div>
 
               <div>
@@ -1333,6 +1434,8 @@ export function RewardsSection({
             )}
           </div>
 
+                
+
           {modalError && (
             <div className="bg-red-500/10 border border-red-500/50 text-red-500 text-xs py-3 px-4 rounded-lg text-left">
               <span className="font-bold">{t('error')}:</span> {modalError}
@@ -1363,6 +1466,8 @@ export function AppearanceSection({
   onAccentChange,
   animationsEnabled,
   onAnimationsToggle,
+  trayEnabled,
+  onTrayToggle,
   t,
 }) {
   const themeOptions = [
@@ -1538,6 +1643,22 @@ export function AppearanceSection({
           <p className="text-[10px] text-gray-500 mt-1">{t('lang_help')}</p>
         </section>
 
+        <section className="card space-y-3">
+          <div className="flex items-center justify-between">
+            <label className="label-text">{t('tray_feature_title', 'Tray mode')}</label>
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input
+                type="checkbox"
+                checked={Boolean(trayEnabled)}
+                onChange={(event) => onTrayToggle?.(event.target.checked)}
+                className="sr-only peer"
+              />
+              <div className="w-11 h-6 rounded-full peer transition-all duration-300 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" style={{ backgroundColor: 'var(--bg-panel)', border: '1px solid var(--border-color)' }} />
+            </label>
+          </div>
+          <p className="text-[10px] text-gray-500">{t('tray_feature_help', 'When enabled, closing the app sends it to tray and keeps background services running.')}</p>
+        </section>
+
         <section className="card">
           <label className="label-text mb-2">{t('theme_select')}</label>
           <p className="text-[10px] text-gray-500 mb-4">{t('theme_help')}</p>
@@ -1650,6 +1771,7 @@ export function BlacklistSection({
   config,
   onModerationToggle,
   onModerationSelectChange,
+  onPermissionRoleToggle,
   onMaxRepetitionChange,
   onWordBlacklistChange,
   onUserBlacklistChange,
@@ -1676,8 +1798,61 @@ export function BlacklistSection({
 
   const maxRepetitionValue = Number.parseInt(String(config?.max_repetition ?? 4), 10) || 4
   const repetitionPercent = Math.max(0, Math.min(100, ((maxRepetitionValue - 3) / 7) * 100))
-  const permissionLevel = String(config?.permissionLevel || 'everyone')
+  const legacyPermissionLevel = String(config?.permissionLevel || 'custom').toLowerCase()
+  const defaultPermissionRoles = {
+    everyone: false,
+    follower: false,
+    vip: false,
+    mod: false,
+    bot: false,
+    streamer: false,
+  }
+  const legacyPermissionRoles = {
+    everyone: {
+      everyone: true,
+      follower: true,
+      vip: true,
+      mod: true,
+      bot: true,
+      streamer: true,
+    },
+    followers: {
+      ...defaultPermissionRoles,
+      everyone: false,
+      follower: true,
+    },
+    subs: {
+      ...defaultPermissionRoles,
+      everyone: false,
+      follower: true,
+    },
+    mods: {
+      ...defaultPermissionRoles,
+      everyone: false,
+      vip: true,
+      mod: true,
+      streamer: true,
+    },
+  }
+  const hasPermissionRoles = Boolean(config?.permission_roles && typeof config.permission_roles === 'object')
+  const basePermissionRoles = hasPermissionRoles
+    ? config.permission_roles
+    : (legacyPermissionRoles[legacyPermissionLevel] || defaultPermissionRoles)
+  const permissionRoles = {
+    ...defaultPermissionRoles,
+    ...basePermissionRoles,
+  }
   const nameStyle = String(config?.nameStyle || 'always')
+  const permissionRoleItems = [
+    { key: 'everyone', icon: Users, labelKey: 'perm_role_everyone', color: '#e5e7eb' },
+    { key: 'follower', icon: Heart, labelKey: 'perm_role_follower', color: '#9146ff' },
+    { key: 'vip', icon: Gem, labelKey: 'perm_role_vip', color: '#f472b6' },
+    { key: 'subscriber', icon: Star, labelKey: 'perm_role_subscriber', color: '#fbbf24' },
+    { key: 'artist', icon: Music, labelKey: 'perm_role_artist', color: '#8b5cf6' },
+    { key: 'mod', icon: ShieldCheck, labelKey: 'perm_role_mod', color: '#22c55e' },
+    { key: 'bot', icon: Bot, labelKey: 'perm_role_bot', color: '#94a3b8' },
+    { key: 'streamer', icon: Radio, labelKey: 'perm_role_streamer', color: '#ef4444' },
+  ]
 
   return (
     <div id="section-blacklist" className="tab-content">
@@ -1686,6 +1861,22 @@ export function BlacklistSection({
         <section className="card space-y-4">
           <label className="label-text">{t('content_filters')}</label>
           <div className="grid grid-cols-1 gap-3">
+            <div className="flex items-center justify-between p-4 rounded-xl transition-colors" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-color)' }}>
+              <div>
+                <span className="text-sm font-semibold block">{t('read_chat_messages')}</span>
+                <span className="text-[10px] opacity-50">{t('read_chat_messages_help')}</span>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="sr-only peer"
+                  checked={Boolean(config?.read_chat_messages)}
+                  onChange={(event) => onModerationToggle?.('read_chat_messages', event.target.checked)}
+                />
+                <div className="w-11 h-6 rounded-full peer transition-all duration-300 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" style={{ backgroundColor: 'var(--bg-panel)', border: '1px solid var(--border-color)' }} />
+              </label>
+            </div>
+
             <div className="flex items-center justify-between p-4 rounded-xl transition-colors" style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-color)' }}>
               <div>
                 <span className="text-sm font-semibold block">{t('read_emotes')}</span>
@@ -1768,19 +1959,35 @@ export function BlacklistSection({
 
           <div className="grid grid-cols-1 gap-4">
             <div>
-              <label className="label-text text-[10px] opacity-70 mb-1 block uppercase font-bold">{t('permissions_label')}</label>
-              <div className="relative">
-                <select
-                  id="tts-permission"
-                  value={permissionLevel}
-                  onChange={(event) => onModerationSelectChange?.('permissionLevel', event.target.value)}
-                  className="w-full p-3 rounded-xl bg-black/40 border border-white/10 text-white focus:border-sky-500 transition-colors outline-none appearance-none cursor-pointer text-sm"
-                >
-                  <option value="everyone">{t('perm_everyone')}</option>
-                  <option value="followers">{t('perm_followers')}</option>
-                  <option value="subs">{t('perm_subs')}</option>
-                  <option value="mods">{t('perm_mods')}</option>
-                </select>
+              <label className="label-text text-[10px] opacity-70 mb-2 block uppercase font-bold">{t('permissions_label')}</label>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {permissionRoleItems.map((item) => {
+                  const Icon = item.icon
+                  const checked = Boolean(permissionRoles[item.key])
+
+                  return (
+                    <div
+                      key={item.key}
+                      className="flex items-center justify-between p-4 rounded-xl transition-colors"
+                      style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-color)' }}
+                    >
+                      <span className="flex items-center gap-2 text-sm font-semibold" style={{ color: 'var(--text-main)' }}>
+                        <Icon className="w-4 h-4" style={{ color: item.color }} />
+                        {t(item.labelKey)}
+                      </span>
+
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input
+                          type="checkbox"
+                          className="sr-only peer"
+                          checked={checked}
+                          onChange={(event) => onPermissionRoleToggle?.(item.key, event.target.checked)}
+                        />
+                        <div className="w-11 h-6 rounded-full peer transition-all duration-300 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" style={{ backgroundColor: 'var(--bg-panel)', border: '1px solid var(--border-color)' }} />
+                      </label>
+                    </div>
+                  )
+                })}
               </div>
               <p className="text-[10px] opacity-50 mt-1">{t('permissions_help')}</p>
             </div>
@@ -1871,6 +2078,15 @@ export function VoicesSection({
     [userVoiceRules],
   )
 
+  // Recalculate summaries whenever t changes to ensure language updates
+  const userSummaries = useMemo(() => {
+    const summaries = {}
+    Object.entries(userVoiceRules || {}).forEach(([username, rule]) => {
+      summaries[username] = formatVoiceSummary(rule, azureVoices, t)
+    })
+    return summaries
+  }, [userVoiceRules, azureVoices, t])
+
   const [isEditorOpen, setIsEditorOpen] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [modalError, setModalError] = useState('')
@@ -1897,8 +2113,13 @@ export function VoicesSection({
     [azureVoices, form.lang],
   )
 
+  
+
   useEffect(() => {
     if (!isUserStyleDisabled) return
+    // When user style support is disabled we need to coerce the form to a supported style.
+    // This setState is intentional and safe — suppress the specific rule.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setForm((previous) => {
       if (String(previous.style || 'general') === 'general') {
         return previous
@@ -1999,6 +2220,7 @@ export function VoicesSection({
           <section className="card">
           <div className="flex items-center justify-between mb-4">
             <label className="label-text">{t('voices_help')}</label>
+            <div className="h-[34px] w-[126px] flex items-center" aria-hidden="true" />
           </div>
 
           <div id="user-rules-list" className="space-y-4 mb-6">
@@ -2007,17 +2229,17 @@ export function VoicesSection({
             )}
 
             {userEntries.map(([username, rule]) => {
-              const summary = formatVoiceSummary(rule, azureVoices, t)
+              const summary = userSummaries[username] || formatVoiceSummary(rule, azureVoices, t)
 
               return (
-                <div key={username} className="card p-4 flex items-center justify-between group transition-all user-rule-row">
-                  <div className="flex items-center gap-4 overflow-hidden flex-grow">
-                    <div className="p-2 row-icon-bg rounded-lg shadow-sm">
-                        <User className="w-6 h-6" style={{ color: 'var(--accent-primary)' }} />
+                <div key={username} className="card p-4 flex items-center justify-between gap-4 group transition-all reward-rule-row">
+                  <div className="flex items-center gap-4 overflow-hidden flex-grow min-w-0">
+                    <div className="p-2 row-icon-bg rounded-lg shadow-sm shrink-0">
+                      <User className="w-6 h-6" style={{ color: 'var(--accent-primary)' }} />
                     </div>
 
                     <div className="flex flex-col min-w-0">
-                      <span className="reward-name-text truncate text-sm font-bold">{username}</span>
+                      <span className="reward-name-text truncate text-sm font-semibold">{username}</span>
                       <span className="text-xs text-gray-500 truncate">{summary}</span>
                     </div>
                   </div>
@@ -2052,6 +2274,7 @@ export function VoicesSection({
             onClick={openCreateEditor}
             disabled={isSectionLocked}
             className="font-bold text-sm transition-all hover:opacity-80 active:scale-95 disabled:opacity-50"
+            title={isSectionLocked ? t('btn_connect_twitch') : undefined}
             style={{
               background: isSectionLocked ? 'none' : 'var(--brand-gradient)',
               WebkitBackgroundClip: isSectionLocked ? 'initial' : 'text',
@@ -2115,10 +2338,14 @@ export function VoicesSection({
                     onChange={(event) => {
                       const value = event.currentTarget.value
                       const supportsStyle = hasStyleSupport(azureVoices, value)
+                      // pick a default voice for the newly selected language if available
+                      const matching = (azureVoices || []).filter((voice) => String(voice.Locale || '').toLowerCase().startsWith(String(value || '').toLowerCase()))
+                      const chosenVoice = matching.length ? matching[0].ShortName : (form.voice || defaultVoice)
                       setForm((previous) => ({
                         ...previous,
                         lang: value,
                         style: supportsStyle ? previous.style : 'general',
+                        voice: chosenVoice,
                       }))
                     }}
                     className="w-full p-2 rounded-lg bg-black/50 border border-white/10 text-sm focus:border-sky-500 outline-none"
@@ -2215,6 +2442,8 @@ export function VoicesSection({
               </div>
             </div>
 
+            
+
             {modalError && (
               <div className="bg-red-500/10 border border-red-500/50 text-red-500 text-xs py-3 px-4 rounded-lg text-left">
                 <span className="font-bold">{t('error')}:</span> {modalError}
@@ -2252,6 +2481,10 @@ export function VisualsSection({
   onToggleVtsEnabled,
   onVtsPortChange,
   onToggleVtsConnection,
+  onToggleVtsChannel,
+  onVtsMappingChange,
+  onVtsRangeChange,
+  onRefreshVtsParameters,
   onCopyOverlayUrl,
   onToast,
   t,
@@ -2259,18 +2492,132 @@ export function VisualsSection({
   const obsEnabled = Boolean(config?.obs_server_enabled)
   const overlayShowTtsStatus = Boolean(config?.overlay_show_tts_status ?? config?.overlay_show_status ?? true)
   const overlayShowTwitchStatus = Boolean(config?.overlay_show_twitch_status ?? config?.overlay_show_status ?? true)
+  const vtsEnabled = Boolean(config?.vts_enabled)
+  const vtsPort = Number.parseInt(String(config?.vts_port ?? 8001), 10) || 8001
   const overlayResolution = String(config?.overlay_resolution || '1080p')
-  const overlayLayout = config?.overlay_layout && typeof config.overlay_layout === 'object'
-    ? config.overlay_layout
-    : {
+  const overlayLayout = useMemo(() => {
+    if (config?.overlay_layout && typeof config.overlay_layout === 'object') return config.overlay_layout
+    return {
       chat: { x: 6, y: 70, scale: 1 },
       status_tts: { x: 80, y: 6, scale: 1 },
       status_twitch: { x: 80, y: 12, scale: 1 },
     }
+  }, [config?.overlay_layout])
   const isTwitchLoggedIn = twitchConnection?.state === 'online'
   const isOverlayLocked = !isTwitchLoggedIn
   const ttsStatus = ttsState?.status || 'IDLE'
   const twitchState = twitchConnection?.state || 'offline'
+  const vtsState = String(vtsConnection?.state || 'offline')
+  const isVtsBusy = vtsState === 'connecting' || vtsState === 'authorizing'
+  const isVtsConnected = vtsState === 'connected'
+  const vtsStatusLabelByState = {
+    offline: t('vts_status_offline', 'OFFLINE'),
+    connecting: t('vts_status_connecting', 'CONNECTING...'),
+    connected: t('vts_status_connected', 'CONNECTED'),
+    denied: t('vts_status_denied', 'DENIED'),
+    error: t('vts_status_error', 'ERROR'),
+    authorizing: t('vts_status_authorizing', 'AUTHORIZING...'),
+  }
+  const obsSectionRef = useRef(null)
+  const vtsSectionRef = useRef(null)
+
+  useLayoutEffect(() => {
+    const syncHeights = () => {
+      const obsEl = obsSectionRef.current
+      const vtsEl = vtsSectionRef.current
+      if (!obsEl || !vtsEl) return
+
+      // computeHeaderOffsets removed — we now cache a fixed collapsed height
+
+      const obsHeader = obsEl.querySelector(':scope > .flex.items-center.justify-between') || obsEl.querySelector('.flex.items-center.justify-between')
+      const vtsHeader = vtsEl.querySelector(':scope > .flex.items-center.justify-between') || vtsEl.querySelector('.flex.items-center.justify-between')
+      if (!obsHeader || !vtsHeader) return
+
+      // compute and cache a stable collapsed height based on OBS header + card padding
+      if (!obsSectionRef.collapsedHeight) {
+        const obsStyle = window.getComputedStyle(obsEl)
+        const obsPadTop = Math.round(parseFloat(obsStyle.paddingTop) || 0)
+        const obsPadBottom = Math.round(parseFloat(obsStyle.paddingBottom) || 0)
+        const obsHeaderHeight = Math.round(obsHeader.getBoundingClientRect().height)
+        const fixedTotal = obsHeaderHeight + obsPadTop + obsPadBottom
+        obsSectionRef.collapsedHeight = fixedTotal
+        obsSectionRef.collapsedPadTop = obsPadTop
+        obsSectionRef.collapsedPadBottom = obsPadBottom
+        // normalize header label spacing to avoid differences
+        try {
+          obsHeader.style.height = `${obsHeaderHeight}px`
+          vtsHeader.style.height = `${obsHeaderHeight}px`
+          const obsLabel = obsHeader.querySelector('.label-text')
+          const vtsLabel = vtsHeader.querySelector('.label-text')
+          if (obsLabel) obsLabel.style.marginBottom = '0px'
+          if (vtsLabel) vtsLabel.style.marginBottom = '0px'
+        } catch {
+          // ignore
+        }
+      }
+
+      const targetTotal = obsSectionRef.collapsedHeight
+      const obsPadTop = obsSectionRef.collapsedPadTop
+      const obsPadBottom = obsSectionRef.collapsedPadBottom
+
+      if (!obsEnabled || !vtsEnabled) {
+        obsEl.style.minHeight = `${targetTotal}px`
+        vtsEl.style.minHeight = `${targetTotal}px`
+        vtsEl.style.paddingTop = `${obsPadTop}px`
+        vtsEl.style.paddingBottom = `${obsPadBottom}px`
+      } else {
+        obsEl.style.minHeight = ''
+        vtsEl.style.minHeight = ''
+        vtsEl.style.paddingTop = ''
+        vtsEl.style.paddingBottom = ''
+      }
+    }
+
+    // sync on next frame and on resize
+    requestAnimationFrame(syncHeights)
+    const onResize = () => requestAnimationFrame(syncHeights)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [obsEnabled, vtsEnabled, overlayResolution, overlayShowTtsStatus, overlayShowTwitchStatus])
+  const vtsStatusLabel = vtsStatusLabelByState[vtsState] || vtsStatusLabelByState.offline
+  const vtsConnectButtonLabel = isVtsBusy
+    ? t('vts_btn_waiting', 'WAITING...')
+    : isVtsConnected
+      ? t('vts_btn_disconnect', 'DISCONNECT')
+      : t('vts_btn_connect', 'CONNECT')
+  const vtsParameters = Array.isArray(vtsConnection?.parameters)
+    ? vtsConnection.parameters
+    : []
+  const hasVtsParameters = vtsParameters.length > 0
+  const vtsMappingRows = [
+    {
+      key: 'mouth_open',
+      label: t('vts_channel_mouth_open', 'Mouth Open'),
+      enabledKey: 'vts_mouth_open_enabled',
+      paramKey: 'vts_mouth_open_param',
+      minKey: 'vts_mouth_open_min',
+      maxKey: 'vts_mouth_open_max',
+      fallbackParam: 'MouthOpen',
+    },
+    {
+      key: 'mouth_smile',
+      label: t('vts_channel_mouth_smile', 'Mouth Smile'),
+      enabledKey: 'vts_mouth_smile_enabled',
+      paramKey: 'vts_mouth_smile_param',
+      minKey: 'vts_mouth_smile_min',
+      maxKey: 'vts_mouth_smile_max',
+      fallbackParam: 'MouthSmile',
+    },
+    {
+      key: 'jaw_open',
+      label: t('vts_channel_jaw_open', 'Jaw Open'),
+      enabledKey: 'vts_jaw_open_enabled',
+      paramKey: 'vts_jaw_open_param',
+      minKey: 'vts_jaw_open_min',
+      maxKey: 'vts_jaw_open_max',
+      fallbackParam: 'JawOpen',
+    },
+  ]
   const overlayPreviewUsername = useMemo(() => {
     const username = String(twitchConnection?.username || '').trim()
     if (username) return username.toUpperCase()
@@ -2283,6 +2630,7 @@ export function VisualsSection({
   const overlayTtsStatusRef = useRef(null)
   const overlayTwitchStatusRef = useRef(null)
   const overlayDragRef = useRef(null)
+  const overlayPointerMoveHandlerRef = useRef(null)
   const overlayKeyMoveRef = useRef({ key: '', target: '', timer: null, startedAt: 0 })
   const activeOverlayTargetRef = useRef(null)
   const overlayLayoutRef = useRef(overlayLayout)
@@ -2292,6 +2640,7 @@ export function VisualsSection({
     offsetX: 0,
     offsetY: 0,
   })
+  const [vtsPortDraft, setVtsPortDraft] = useState(String(vtsPort))
 
   const overlayResolutions = [
     { value: '2160p', label: '4K (3840x2160)', width: 3840, height: 2160 },
@@ -2331,6 +2680,10 @@ export function VisualsSection({
     MIN_OVERLAY_SCALE,
     Math.min(MAX_OVERLAY_SCALE, Number.parseFloat(String(overlayLayout?.status_twitch?.scale ?? 1)) || 1),
   )
+
+  useEffect(() => {
+    setVtsPortDraft(String(vtsPort))
+  }, [vtsPort])
 
   useLayoutEffect(() => {
     overlayLayoutRef.current = overlayLayout
@@ -2385,6 +2738,7 @@ export function VisualsSection({
     }
   }
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const updateOverlayLayout = (target, xPercent, yPercent, scaleValue) => {
     if (target !== 'status_tts' && target !== 'status_twitch') return
 
@@ -2472,6 +2826,7 @@ export function VisualsSection({
     })
   }
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const getStageMetrics = () => {
     const stage = overlayPreviewStageRef.current
     if (!stage) return null
@@ -2654,11 +3009,17 @@ export function VisualsSection({
     )
   }
 
-  const stopOverlayDrag = () => {
+  overlayPointerMoveHandlerRef.current = handleOverlayPointerMove
+
+  const handleOverlayPointerMoveGlobal = useCallback((event) => {
+    overlayPointerMoveHandlerRef.current?.(event)
+  }, [])
+
+  const stopOverlayDrag = useCallback(() => {
     overlayDragRef.current = null
-    window.removeEventListener('pointermove', handleOverlayPointerMove)
+    window.removeEventListener('pointermove', handleOverlayPointerMoveGlobal)
     window.removeEventListener('pointerup', stopOverlayDrag)
-  }
+  }, [handleOverlayPointerMoveGlobal])
 
   const handleOverlayPointerDown = (event, target) => {
     if (event.button !== 0) return
@@ -2714,7 +3075,7 @@ export function VisualsSection({
     }
 
     event.currentTarget.setPointerCapture?.(event.pointerId)
-    window.addEventListener('pointermove', handleOverlayPointerMove)
+    window.addEventListener('pointermove', handleOverlayPointerMoveGlobal)
     window.addEventListener('pointerup', stopOverlayDrag)
     event.preventDefault()
   }
@@ -2832,7 +3193,7 @@ export function VisualsSection({
 
   useEffect(() => () => {
     stopOverlayDrag()
-  }, [])
+  }, [stopOverlayDrag])
 
   useEffect(() => () => {
     stopOverlayKeyMove()
@@ -2852,10 +3213,10 @@ export function VisualsSection({
   return (
     <div id="section-visuals" className="tab-content">
       <SectionTitle>{t('title_visuals_vts')}</SectionTitle>
-      <div className="grid gap-6">
-        <div className="section-lock-wrapper">
-          <div>
-            <section className="card space-y-4">
+      <div className="section-lock-wrapper">
+        <div className={isOverlayLocked ? 'section-lock-content' : ''}>
+          <div className="grid gap-6">
+            <section ref={obsSectionRef} className="card space-y-4">
               <div className="flex items-center justify-between">
                 <label className="label-text">{t('visuals_header')}</label>
                 <label className="relative inline-flex items-center cursor-pointer">
@@ -2872,39 +3233,49 @@ export function VisualsSection({
               </div>
 
               <div id="obs-widget-tools" className={`space-y-6 anim-entry ${obsEnabled ? '' : 'hidden'}`}>
-                <div className="p-4 rounded-xl border" style={{ backgroundColor: 'var(--bg-input)', borderColor: 'var(--border-color)' }}>
-                  <p className="text-xs leading-relaxed font-medium" style={{ color: 'var(--text-main)' }}>
-                    {t('visuals_info')}
-                  </p>
+
+
+                <div className="space-y-2">
+                  <label className="label-text text-[10px] opacity-70 mb-1 block uppercase font-bold">{t('overlay_url_label')}</label>
+                  <div className="flex gap-2">
+                    <input type="text" id="overlay-path-input" readOnly className="w-full p-3 rounded-xl font-mono text-xs outline-none transition-all cursor-default border" style={{ backgroundColor: 'var(--bg-input)', borderColor: 'var(--border-color)', color: 'var(--accent-primary)' }} value={overlayUrl || 'http://127.0.0.1:8080'} />
+                    <button onClick={handleCopyOverlayUrl} className="p-3 rounded-xl transition-all border group relative overflow-hidden active:scale-95" style={{ backgroundColor: 'var(--bg-input)', borderColor: 'var(--border-color)', color: 'var(--accent-primary)' }} title={t('copy_action', 'Copy')}>
+                      <Copy className="w-5 h-5" />
+                    </button>
+                  </div>
                 </div>
 
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                  <div className="flex items-center justify-between">
-                    <label className="label-text text-[10px] opacity-70 uppercase font-bold">{t('overlay_show_tts_status', 'Show TTS status')}</label>
-                    <label className="relative inline-flex items-center cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={overlayShowTtsStatus}
-                        onChange={(event) => onOverlayStatusToggle?.('tts', event.target.checked)}
-                        disabled={isOverlayLocked}
-                        className="sr-only peer"
-                      />
-                      <div className="w-11 h-6 rounded-full peer transition-all duration-300 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" style={{ backgroundColor: 'var(--bg-panel)', border: '1px solid var(--border-color)' }} />
-                    </label>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <label className="label-text text-[10px] opacity-70 uppercase font-bold">{t('overlay_show_twitch_status', 'Show Twitch status')}</label>
-                    <label className="relative inline-flex items-center cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={overlayShowTwitchStatus}
-                        onChange={(event) => onOverlayStatusToggle?.('twitch', event.target.checked)}
-                        disabled={isOverlayLocked}
-                        className="sr-only peer"
-                      />
-                      <div className="w-11 h-6 rounded-full peer transition-all duration-300 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" style={{ backgroundColor: 'var(--bg-panel)', border: '1px solid var(--border-color)' }} />
-                    </label>
-                  </div>
+                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  {[
+                    {
+                      key: 'tts',
+                      checked: overlayShowTtsStatus,
+                      label: t('overlay_show_tts_status', 'Show TTS status'),
+                    },
+                    {
+                      key: 'twitch',
+                      checked: overlayShowTwitchStatus,
+                      label: t('overlay_show_twitch_status', 'Show Twitch status'),
+                    },
+                  ].map((item) => (
+                    <div
+                      key={item.key}
+                      className="flex items-center justify-between p-4 rounded-xl transition-colors"
+                      style={{ backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-color)' }}
+                    >
+                      <span className="text-sm font-semibold" style={{ color: 'var(--text-main)' }}>{item.label}</span>
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={item.checked}
+                          onChange={(event) => onOverlayStatusToggle?.(item.key, event.target.checked)}
+                          disabled={isOverlayLocked}
+                          className="sr-only peer"
+                        />
+                        <div className="w-11 h-6 rounded-full peer transition-all duration-300 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" style={{ backgroundColor: 'var(--bg-panel)', border: '1px solid var(--border-color)' }} />
+                      </label>
+                    </div>
+                  ))}
                 </div>
 
                 <div className="space-y-2">
@@ -3130,57 +3501,203 @@ export function VisualsSection({
                   <p className="text-[10px] opacity-50">{t('overlay_layout_help')}</p>
                 </div>
 
-                <div className="space-y-2">
-                  <label className="label-text text-[10px] opacity-70 mb-1 block uppercase font-bold">{t('overlay_url_label')}</label>
-                  <div className="flex gap-2">
-                    <input type="text" id="overlay-path-input" readOnly className="w-full p-3 rounded-xl font-mono text-xs outline-none transition-all cursor-default border" style={{ backgroundColor: 'var(--bg-input)', borderColor: 'var(--border-color)', color: 'var(--accent-primary)' }} value={overlayUrl || 'http://127.0.0.1:8080'} />
-                    <button onClick={handleCopyOverlayUrl} className="p-3 rounded-xl transition-all border group relative overflow-hidden active:scale-95" style={{ backgroundColor: 'var(--bg-input)', borderColor: 'var(--border-color)', color: 'var(--accent-primary)' }} title={t('copy_action', 'Copy')}>
-                      <Copy className="w-5 h-5" />
-                    </button>
-                  </div>
-                  <p className="text-[10px] opacity-50 mt-1">{t('overlay_help')}</p>
-                </div>
               </div>
 
-              {!obsEnabled && (
-                <p className="text-[10px] text-gray-500">
-                  {t('overlay_help')}
-                </p>
-              )}
+
             </section>
-          </div>
-          {isOverlayLocked && (
-            <div className="section-lock-overlay" role="status" aria-live="polite" style={{ pointerEvents: 'none' }}>
-              <div className="section-lock-card">
-                <p className="text-sm font-semibold">{t('rewards_locked')}</p>
-              </div>
-            </div>
-          )}
-        </div>
 
-        <div className="section-lock-wrapper">
-          <div className={isOverlayLocked ? 'section-lock-content' : ''}>
-            <section className="card space-y-5 vts-disabled-card">
+            <section ref={vtsSectionRef} className="card space-y-4">
               <div className="flex items-center justify-between">
                 <label className="label-text">{t('vts_header')}</label>
-                <span className="vts-dev-badge">{t('vts_under_development', 'Fejlesztés alatt')}</span>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={vtsEnabled}
+                    onChange={(event) => onToggleVtsEnabled?.(event.target.checked)}
+                    disabled={isOverlayLocked}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 rounded-full peer transition-all duration-300 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" style={{ backgroundColor: 'var(--bg-panel)', border: '1px solid var(--border-color)' }} />
+                </label>
               </div>
 
-              <div className="vts-disabled-content p-4 rounded-xl border">
-                <p className="text-sm font-semibold">{t('vts_under_development', 'Fejlesztés alatt')}</p>
-                <p className="text-[10px] opacity-70 mt-2">{t('vts_under_development_desc', 'This integration is currently under development.')}</p>
+              
+
+              <div className={`space-y-4 anim-entry ${vtsEnabled ? '' : 'hidden'}`}>
+                <div className="space-y-1">
+                  <label htmlFor="vts-port" className="label-text text-[10px] opacity-70 mb-1 block uppercase font-bold">{t('websocket_port')}</label>
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_180px] md:items-center">
+                    <input
+                      id="vts-port"
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      maxLength={5}
+                      value={vtsPortDraft}
+                      onChange={(event) => {
+                        const digitsOnly = String(event.target.value || '').replace(/\D+/g, '').slice(0, 5)
+                        setVtsPortDraft(digitsOnly)
+                        if (digitsOnly) {
+                          onVtsPortChange?.(digitsOnly)
+                        }
+                      }}
+                      onBlur={() => {
+                        const parsedPort = Number.parseInt(vtsPortDraft, 10)
+                        const safePort = Number.isFinite(parsedPort) && parsedPort > 0
+                          ? parsedPort
+                          : 8001
+                        setVtsPortDraft(String(safePort))
+                        onVtsPortChange?.(safePort)
+                      }}
+                      disabled={isOverlayLocked || isVtsConnected || isVtsBusy}
+                    />
+                    <button
+                        id="btn-vts-connect"
+                      type="button"
+                      onClick={onToggleVtsConnection}
+                        disabled={isOverlayLocked}
+                        className={`btn-primary text-white w-full md:w-[180px] h-[48px] px-4 rounded-xl text-xs font-bold transition-colors tracking-wider shadow-lg ${
+                        isVtsConnected
+                            ? 'is-connected'
+                          : isVtsBusy
+                              ? 'opacity-80 cursor-wait'
+                              : 'shadow-sky-500/20'
+                      }`}
+                    >
+                      {vtsConnectButtonLabel}
+                    </button>
+                  </div>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-[10px] opacity-50">{t('vts_port_help', 'Default VTube Studio port: 8001')}</p>
+                  <span className="text-[10px] font-semibold uppercase tracking-wide opacity-80" style={{ color: 'var(--accent-primary)' }}>
+                    {vtsStatusLabel}
+                  </span>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="label-text text-[10px] opacity-70 uppercase font-bold">{t('vts_mapping_title', 'Lip-Sync variable mapping')}</label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] opacity-60">
+                        {hasVtsParameters
+                          ? `${vtsParameters.length} ${t('vts_variables_found', 'variables')}`
+                          : t('vts_variables_none', 'No variables loaded')}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={onRefreshVtsParameters}
+                        disabled={isOverlayLocked || vtsState !== 'connected' || isVtsBusy}
+                        className="btn-secondary btn-compact"
+                        title={t('vts_refresh_model', 'Refresh model variables')}
+                        aria-label={t('vts_refresh_model', 'Refresh model variables')}
+                      >
+                        <RefreshCw className={isVtsBusy ? 'animate-spin' : ''} />
+                      </button>
+                    </div>
+                  </div>
+
+                  {vtsMappingRows.map((row) => {
+                    const rowEnabled = config?.[row.enabledKey] !== false
+                    const preferredParameter = String(config?.[row.paramKey] || row.fallbackParam || '').trim()
+                    const hasPreferredParameter = vtsParameters.some((parameter) => parameter.id === preferredParameter)
+                    const selectedParameterId = hasPreferredParameter ? preferredParameter : ''
+                    const selectedParameter = vtsParameters.find((parameter) => parameter.id === selectedParameterId)
+                    const parameterMin = Number.isFinite(Number(selectedParameter?.min)) ? Number(selectedParameter.min) : 0
+                    const parameterMax = Number.isFinite(Number(selectedParameter?.max)) ? Number(selectedParameter.max) : 1
+                    const resolvedMinValue = Number.isFinite(Number(config?.[row.minKey]))
+                      ? Number(config[row.minKey])
+                      : parameterMin
+                    const resolvedMaxValue = Number.isFinite(Number(config?.[row.maxKey]))
+                      ? Number(config[row.maxKey])
+                      : parameterMax
+
+                    return (
+                      <div key={row.key} className="p-3 rounded-xl border" style={{ backgroundColor: 'var(--bg-input)', borderColor: 'var(--border-color)' }}>
+                        <div className="grid grid-cols-[minmax(0,1fr)_56px] items-center gap-3">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="inline-flex items-center justify-center w-6 h-6 rounded-md shrink-0" style={{ color: 'var(--accent-primary)', border: '1px solid var(--accent-primary)', backgroundColor: 'rgba(0,0,0,0.15)' }}>
+                              <VtsChannelIcon channelKey={row.key} />
+                            </span>
+                            <span className="text-sm font-semibold truncate" style={{ color: 'var(--text-main)' }}>{row.label}</span>
+                          </div>
+                          <div className="flex justify-end">
+                            <label className="relative inline-flex items-center cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={rowEnabled}
+                                onChange={(event) => onToggleVtsChannel?.(row.enabledKey, event.target.checked)}
+                                disabled={isOverlayLocked || vtsState !== 'connected'}
+                                className="sr-only peer"
+                              />
+                              <div className="w-11 h-6 rounded-full peer transition-all duration-300 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" style={{ backgroundColor: 'var(--bg-panel)', border: '1px solid var(--border-color)' }} />
+                            </label>
+                          </div>
+                        </div>
+
+                        {rowEnabled && (
+                          <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_110px_110px] mt-3">
+                            <div>
+                              <label className="label-text text-[10px] opacity-70 mb-1 block uppercase font-bold">{t('vts_parameter_label', 'Variable')}</label>
+                              <select
+                                value={selectedParameterId}
+                                onChange={(event) => onVtsMappingChange?.(row.paramKey, event.target.value)}
+                                disabled={isOverlayLocked || !hasVtsParameters || !rowEnabled || vtsState !== 'connected'}
+                              >
+                                <option value="">{t('vts_parameter_none', 'Not selected')}</option>
+                                {vtsParameters.map((parameter) => (
+                                  <option key={parameter.id} value={parameter.id}>
+                                    {parameter.name} ({parameter.id})
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            <div>
+                              <label className="label-text text-[10px] opacity-70 mb-1 block uppercase font-bold">{t('vts_range_min', 'Min')}</label>
+                              <input
+                                type="number"
+                                step="0.01"
+                                min={Math.min(parameterMin, parameterMax)}
+                                max={Math.max(parameterMin, parameterMax)}
+                                value={resolvedMinValue}
+                                disabled={isOverlayLocked || !selectedParameterId || !rowEnabled || vtsState !== 'connected'}
+                                onChange={(event) => onVtsRangeChange?.(row.minKey, event.target.value)}
+                              />
+                            </div>
+
+                            <div>
+                              <label className="label-text text-[10px] opacity-70 mb-1 block uppercase font-bold">{t('vts_range_max', 'Max')}</label>
+                              <input
+                                type="number"
+                                step="0.01"
+                                min={Math.min(parameterMin, parameterMax)}
+                                max={Math.max(parameterMin, parameterMax)}
+                                value={resolvedMaxValue}
+                                disabled={isOverlayLocked || !selectedParameterId || !rowEnabled || vtsState !== 'connected'}
+                                onChange={(event) => onVtsRangeChange?.(row.maxKey, event.target.value)}
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+
+                <p className="text-[10px] opacity-60">{t('vts_config_desc')}</p>
               </div>
             </section>
           </div>
-
-          {isOverlayLocked && (
-            <div className="section-lock-overlay" role="status" aria-live="polite">
-              <div className="section-lock-card">
-                <p className="text-sm font-semibold">{t('rewards_locked')}</p>
-              </div>
-            </div>
-          )}
         </div>
+
+        {isOverlayLocked && (
+          <div className="section-lock-overlay" role="status" aria-live="polite" style={{ pointerEvents: 'none' }}>
+            <div className="section-lock-card">
+              <p className="text-sm font-semibold">{t('rewards_locked')}</p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -3231,6 +3748,93 @@ export function LogsSection({ logs, t }) {
         </div>
       </section>
     </div>
+  )
+}
+
+export function AboutSection({ t, projectGithubUrl }) {
+  const [showLicense, setShowLicense] = useState(false)
+  const licenseModal = showLicense && typeof document !== 'undefined'
+    ? createPortal(
+      <div className="fixed inset-0 overlay-mask modal-active p-4" role="dialog" aria-modal="true">
+        <div className="modal-card w-full max-w-3xl p-8 rounded-2xl shadow-2xl text-left flex flex-col" style={{ maxHeight: '90vh' }}>
+          <div className="flex justify-between items-center border-b border-white/10 pb-4 mb-6">
+            <h3 className="font-bold text-xl text-white">{t('about_license_button', 'View license')}</h3>
+            <button
+              type="button"
+              onClick={() => setShowLicense(false)}
+              className="editor-close-btn cursor-pointer hover:text-red-500 transition-colors"
+              aria-label={t('close', 'Close')}
+            >
+              <X className="w-6 h-6" />
+            </button>
+          </div>
+
+          <div className="update-modal-markdown overflow-y-auto pr-2 custom-scrollbar" style={{ maxHeight: 'calc(90vh - 120px)' }}>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {LICENSE_TEXT}
+            </ReactMarkdown>
+          </div>
+        </div>
+      </div>,
+      document.body,
+    )
+    : null
+
+  return (
+    <>
+      <div id="section-about" className="tab-content">
+        <SectionTitle>{t('about_title', 'About')}</SectionTitle>
+        <div className="grid gap-6">
+          <section className="card space-y-3">
+            <label className="label-text">{t('about_intro_title', 'Project')}</label>
+            <p className="text-sm leading-relaxed text-gray-500">
+              {t('about_intro', 'AetherStream is a desktop tool for Twitch TTS, voice rules, and stream overlays.')}
+            </p>
+          </section>
+
+          <section className="card space-y-3">
+            <label className="label-text">{t('about_links_title', 'Links')}</label>
+            <div className="grid gap-3">
+              <LinkCard
+                href={projectGithubUrl}
+                title={t('about_github', 'GitHub')}
+                description={t('about_github_desc', 'Source code, issues, and releases.')}
+                icon={Github}
+              />
+              <LinkCard
+                title={t('about_discord', 'Discord')}
+                description={t('about_discord_desc', 'Community link coming soon.')}
+                icon={SiDiscord}
+                disabled
+              />
+              <LinkCard
+                title={t('about_website', 'Website')}
+                description={t('about_website_desc', 'Project website coming soon.')}
+                icon={Globe}
+                disabled
+              />
+            </div>
+          </section>
+
+          <section className="card space-y-3">
+            <label className="label-text">{t('about_developer_title', 'Developer')}</label>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-xs text-gray-500 leading-relaxed sm:max-w-[70%]">
+                {t('about_developer', 'Built by Daikh • © 2025-2026')}
+              </p>
+              <button
+                type="button"
+                className="btn-primary px-4 rounded-xl text-xs font-semibold uppercase tracking-wider shadow-lg shadow-sky-500/20 whitespace-nowrap sm:self-start"
+                onClick={() => setShowLicense(true)}
+              >
+                {t('about_license_button', 'View license')}
+              </button>
+            </div>
+          </section>
+        </div>
+      </div>
+      {licenseModal}
+    </>
   )
 }
 
@@ -3318,6 +3922,7 @@ export function ResetSection({
 export function SectionRenderer({
   activeSection,
   t,
+  projectGithubUrl,
   appLang,
   onLanguageChange,
   onValidateAzure,
@@ -3328,6 +3933,8 @@ export function SectionRenderer({
   onAccentChange,
   animationsEnabled,
   onAnimationsToggle,
+  trayEnabled,
+  onTrayToggle,
   onTestTts,
   onPreviewVoice,
   onLiveTtsChange,
@@ -3368,6 +3975,7 @@ export function SectionRenderer({
   isCheckingForUpdates,
   onModerationToggle,
   onModerationSelectChange,
+  onPermissionRoleToggle,
   onMaxRepetitionChange,
   onWordBlacklistChange,
   onUserBlacklistChange,
@@ -3380,6 +3988,10 @@ export function SectionRenderer({
   onToggleVtsEnabled,
   onVtsPortChange,
   onToggleVtsConnection,
+  onToggleVtsChannel,
+  onVtsMappingChange,
+  onVtsRangeChange,
+  onRefreshVtsParameters,
   onCopyOverlayUrl,
   onToast,
 }) {
@@ -3473,6 +4085,8 @@ export function SectionRenderer({
           onAccentChange={onAccentChange}
           animationsEnabled={animationsEnabled}
           onAnimationsToggle={onAnimationsToggle}
+          trayEnabled={trayEnabled}
+          onTrayToggle={onTrayToggle}
           t={t}
         />
       )
@@ -3491,6 +4105,10 @@ export function SectionRenderer({
           onToggleVtsEnabled={onToggleVtsEnabled}
           onVtsPortChange={onVtsPortChange}
           onToggleVtsConnection={onToggleVtsConnection}
+          onToggleVtsChannel={onToggleVtsChannel}
+          onVtsMappingChange={onVtsMappingChange}
+          onVtsRangeChange={onVtsRangeChange}
+          onRefreshVtsParameters={onRefreshVtsParameters}
           onCopyOverlayUrl={onCopyOverlayUrl}
           onToast={onToast}
           t={t}
@@ -3502,6 +4120,7 @@ export function SectionRenderer({
           config={config}
           onModerationToggle={onModerationToggle}
           onModerationSelectChange={onModerationSelectChange}
+          onPermissionRoleToggle={onPermissionRoleToggle}
           onMaxRepetitionChange={onMaxRepetitionChange}
           onWordBlacklistChange={onWordBlacklistChange}
           onUserBlacklistChange={onUserBlacklistChange}
@@ -3510,6 +4129,8 @@ export function SectionRenderer({
       )
     case 'logs':
       return <LogsSection logs={logs} t={t} />
+    case 'about':
+      return <AboutSection t={t} projectGithubUrl={projectGithubUrl} />
     case 'reset':
       return (
         <ResetSection

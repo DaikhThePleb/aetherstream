@@ -1,4 +1,5 @@
 import {
+  onBackendEvent,
   playTts,
   ttsClear,
   ttsPause,
@@ -20,14 +21,63 @@ let config = {
 }
 
 const listeners = new Set()
+let playbackStartedListenerReady = false
+let requestCounter = 0
 
-function emitState() {
+function nextPlaybackRequestId() {
+  requestCounter += 1
+  return `tts-${Date.now()}-${requestCounter}`
+}
+
+function ensurePlaybackStartedListener() {
+  if (playbackStartedListenerReady) return
+  playbackStartedListenerReady = true
+
+  void onBackendEvent('tts-playback-started', (payload) => {
+    const requestId = String(payload?.request_id || '').trim()
+    const startedAt = Number(payload?.started_at || 0)
+    if (!requestId || !currentItem || currentItem.requestId !== requestId) {
+      return
+    }
+
+    const safeStartedAt = Number.isFinite(startedAt) && startedAt > 0
+      ? startedAt
+      : Date.now()
+
+    currentItem = {
+      ...currentItem,
+      startedAt: safeStartedAt,
+    }
+    emitState()
+  })
+}
+
+function buildQueueState() {
   const status = isPaused ? 'PAUSED' : currentItem ? 'PLAYING' : 'IDLE'
   const count = queue.length + (currentItem ? 1 : 0)
 
+  return {
+    status,
+    count,
+    currentText: currentItem?.text || '',
+    currentOptions: currentItem
+      ? {
+        voice: currentItem.voice,
+        rate: currentItem.rate,
+        pitch: currentItem.pitch,
+        style: currentItem.style,
+      }
+      : null,
+    startedAt: Number(currentItem?.startedAt || 0),
+  }
+}
+
+function emitState() {
+  const state = buildQueueState()
+
   listeners.forEach((listener) => {
     try {
-      listener({ status, count })
+      listener(state)
     } catch (error) {
       console.error('[tts-queue] listener failed', error)
     }
@@ -45,6 +95,8 @@ function finishCurrentItem(success = true, error = null) {
 }
 
 async function processQueue() {
+  ensurePlaybackStartedListener()
+
   if (currentItem || isPaused) {
     emitState()
     return
@@ -56,7 +108,13 @@ async function processQueue() {
     return
   }
 
-  currentItem = next
+  const requestId = nextPlaybackRequestId()
+
+  currentItem = {
+    ...next,
+    requestId,
+    startedAt: 0,
+  }
   emitState()
 
   try {
@@ -68,6 +126,7 @@ async function processQueue() {
       style: next.style || config.global_style || 'general',
       volume: config.volume ?? 50,
       audio_device: config.audio_device || 'default',
+      request_id: requestId,
     })
 
     if (!response?.success) {
@@ -92,10 +151,7 @@ export function subscribeTtsQueue(listener) {
   if (typeof listener !== 'function') return () => {}
 
   listeners.add(listener)
-  listener({
-    status: isPaused ? 'PAUSED' : currentItem ? 'PLAYING' : 'IDLE',
-    count: queue.length + (currentItem ? 1 : 0),
-  })
+  listener(buildQueueState())
 
   return () => {
     listeners.delete(listener)

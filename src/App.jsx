@@ -10,7 +10,8 @@ import { startTwitchBot, stopTwitchBot } from './services/twitchBot'
 import {
   connectVts,
   disconnectVts,
-  injectVtsMouth,
+  injectVtsParameters,
+  requestVtsParameters,
   setVtsAuthToken,
   subscribeVtsStatus,
 } from './services/vtsClient'
@@ -42,17 +43,25 @@ import {
   overlaySetEnabled,
   overlayUpdateConfig,
   listAudioOutputDevices,
+  hideWindow,
   minimizeWindow,
   importPresetFile,
   onWindowCloseRequested,
   downloadAndRunInstaller,
+  sendToTray,
+  setGlobalHotkeys,
+  setTrayEnabled,
   saveConfig,
   toggleMaximizeWindow,
   validateTwitchToken,
   twitchLogin,
+  updateTrayLanguage,
   updateTwitchReward,
+  onBackendEvent,
   isTauriRuntime,
 } from './services/tauriApi'
+
+const PROJECT_GITHUB_URL = 'https://github.com/DaikhThePleb/aetherstream'
 
 const defaultAccent = {
   primary: '#00f2ff',
@@ -75,6 +84,196 @@ const DEFAULT_TWITCH_AVATAR = 'https://static-cdn.jtvnw.net/user-default-picture
 const TWITCH_CLIENT_ID = String(import.meta.env.VITE_TWITCH_CLIENT_ID || '').trim()
 const GITHUB_REPO_OWNER = String(import.meta.env.VITE_GITHUB_REPO_OWNER || 'DaikhThePleb').trim()
 const GITHUB_REPO_NAME = String(import.meta.env.VITE_GITHUB_REPO_NAME || 'aetherstream').trim()
+const FOLLOWER_CACHE_TTL_MS = 5 * 60 * 1000
+const FOLLOWER_CACHE_ERROR_TTL_MS = 60 * 1000
+const VTS_LIP_SYNC_INTERVAL_MS = 55
+const VTS_CHANNEL_DEFAULTS = Object.freeze({
+  mouth_open: {
+    frameKey: 'mouthOpen',
+    enabledKey: 'vts_mouth_open_enabled',
+    paramKey: 'vts_mouth_open_param',
+    minKey: 'vts_mouth_open_min',
+    maxKey: 'vts_mouth_open_max',
+    fallbackParam: 'MouthOpen',
+  },
+  mouth_smile: {
+    frameKey: 'mouthSmile',
+    enabledKey: 'vts_mouth_smile_enabled',
+    paramKey: 'vts_mouth_smile_param',
+    minKey: 'vts_mouth_smile_min',
+    maxKey: 'vts_mouth_smile_max',
+    fallbackParam: 'MouthSmile',
+  },
+  jaw_open: {
+    frameKey: 'jawOpen',
+    enabledKey: 'vts_jaw_open_enabled',
+    paramKey: 'vts_jaw_open_param',
+    minKey: 'vts_jaw_open_min',
+    maxKey: 'vts_jaw_open_max',
+    fallbackParam: 'JawOpen',
+  },
+})
+
+const clampToRange = (value, min, max) => {
+  const safeMin = Number.isFinite(min) ? min : 0
+  const safeMax = Number.isFinite(max) ? max : 1
+  const lower = Math.min(safeMin, safeMax)
+  const upper = Math.max(safeMin, safeMax)
+  const numeric = Number(value)
+
+  if (!Number.isFinite(numeric)) {
+    return lower
+  }
+
+  return Math.max(lower, Math.min(upper, numeric))
+}
+
+const parseSpeechRate = (value) => {
+  const numeric = Number.parseFloat(String(value ?? '1.0'))
+  if (!Number.isFinite(numeric)) return 1
+  return clampToRange(numeric, 0.55, 2.2)
+}
+
+const normalizeSpeechCharacter = (character) => String(character || '')
+  .normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .toLowerCase()
+
+const _buildLipFramesFromText = (text, rateInput) => {
+  const normalizedText = String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (!normalizedText) {
+    return [
+      { mouthOpen: 0.08, mouthSmile: 0.06, jawOpen: 0.08 },
+      { mouthOpen: 0.1, mouthSmile: 0.08, jawOpen: 0.1 },
+    ]
+  }
+
+  const rate = parseSpeechRate(rateInput)
+  const punctuationPattern = /[.,!?;:]/
+  const labialPattern = /[bmpfvw]/
+  const smilePattern = /[eiszxcj]/
+  const vowelPattern = /[aeiouy]/
+  const jawHeavyPattern = /[aouq]/
+
+  const segments = Array.from(normalizedText).map((rawCharacter) => {
+    const character = normalizeSpeechCharacter(rawCharacter)
+    const isWhitespace = /\s/.test(rawCharacter)
+    const isPunctuation = punctuationPattern.test(rawCharacter)
+    const isLabial = labialPattern.test(character)
+    const isSmile = smilePattern.test(character)
+    const isVowel = vowelPattern.test(character)
+    const isJawHeavy = jawHeavyPattern.test(character)
+
+    const baseDuration = isWhitespace
+      ? 36
+      : isPunctuation
+        ? 105
+        : isVowel
+          ? 78
+          : 60
+
+    const durationMs = clampToRange(baseDuration / rate, 24, 210)
+
+    if (isWhitespace || isPunctuation) {
+      return {
+        durationMs,
+        mouthOpen: 0.08,
+        mouthSmile: 0.06,
+        jawOpen: 0.08,
+      }
+    }
+
+    const mouthOpen = isVowel
+      ? 0.74
+      : isLabial
+        ? 0.2
+        : 0.38
+    const mouthSmile = isSmile
+      ? 0.64
+      : isVowel
+        ? 0.24
+        : 0.16
+    const jawOpen = isJawHeavy
+      ? 0.76
+      : isVowel
+        ? 0.52
+        : 0.28
+
+    return {
+      durationMs,
+      mouthOpen,
+      mouthSmile,
+      jawOpen,
+    }
+  })
+
+  const totalDurationMs = segments.reduce((sum, segment) => sum + segment.durationMs, 0)
+  const frameCount = Math.max(10, Math.ceil(totalDurationMs / VTS_LIP_SYNC_INTERVAL_MS))
+  const frames = []
+
+  let segmentIndex = 0
+  let segmentStartMs = 0
+
+  for (let index = 0; index < frameCount; index += 1) {
+    const currentTimeMs = frameCount > 1
+      ? (index / (frameCount - 1)) * totalDurationMs
+      : totalDurationMs
+
+    while (
+      segmentIndex < segments.length - 1
+      && segmentStartMs + segments[segmentIndex].durationMs < currentTimeMs
+    ) {
+      segmentStartMs += segments[segmentIndex].durationMs
+      segmentIndex += 1
+    }
+
+    const currentSegment = segments[segmentIndex]
+    const nextSegment = segments[Math.min(segmentIndex + 1, segments.length - 1)]
+    const localDurationMs = Math.max(1, currentSegment.durationMs)
+    const localProgress = clampToRange((currentTimeMs - segmentStartMs) / localDurationMs, 0, 1)
+    const smoothProgress = localProgress * localProgress * (3 - (2 * localProgress))
+    const flutter = Math.sin((index / Math.max(1, frameCount - 1)) * Math.PI * 12) * 0.04
+
+    let mouthOpen = clampToRange(
+      currentSegment.mouthOpen + ((nextSegment.mouthOpen - currentSegment.mouthOpen) * smoothProgress) + flutter,
+      0,
+      1,
+    )
+    let mouthSmile = clampToRange(
+      currentSegment.mouthSmile + ((nextSegment.mouthSmile - currentSegment.mouthSmile) * smoothProgress) + (flutter * 0.35),
+      0,
+      1,
+    )
+    let jawOpen = clampToRange(
+      currentSegment.jawOpen + ((nextSegment.jawOpen - currentSegment.jawOpen) * smoothProgress) + (flutter * 0.45),
+      0,
+      1,
+    )
+
+    frames.push({
+      mouthOpen: clampToRange(
+        mouthOpen,
+        0,
+        1,
+      ),
+      mouthSmile: clampToRange(
+        mouthSmile,
+        0,
+        1,
+      ),
+      jawOpen: clampToRange(
+        jawOpen,
+        0,
+        1,
+      ),
+    })
+  }
+
+  return frames
+}
 
 const normalizeReleaseVersion = (value) => String(value || '').trim().replace(/^v/i, '')
 
@@ -568,7 +767,8 @@ const hideMessageBox = (boxId) => {
 
 const parseListFromTextarea = (rawText) => {
   const tokens = String(rawText || '')
-    .replace(/[\u0000-\u001f]+/g, ' ')
+    // Normalize whitespace and remove control characters by collapsing whitespace
+    .replace(/\s+/g, ' ')
     .split(/[\s,;]+/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
@@ -639,21 +839,180 @@ const containsBlockedWord = (text, blockedWords) => {
   })
 }
 
-const canSpeakByPermissionLevel = (permissionLevel, badges) => {
-  const normalizedPermission = String(permissionLevel || 'everyone').toLowerCase()
-  const safeBadges = badges && typeof badges === 'object' ? badges : {}
+const DEFAULT_PERMISSION_ROLES = Object.freeze({
+  everyone: false,
+  follower: false,
+  vip: false,
+  mod: false,
+  subscriber: false,
+  artist: false,
+  bot: false,
+  streamer: false,
+})
 
-  switch (normalizedPermission) {
-    case 'mods':
-      return Boolean(safeBadges.broadcaster || safeBadges.moderator || safeBadges.vip)
-    case 'subs':
-      return Boolean(safeBadges.subscriber || safeBadges.broadcaster || safeBadges.moderator)
-    case 'followers':
-      return true
-    case 'everyone':
-    default:
-      return true
+const LEGACY_PERMISSION_ROLE_MAP = Object.freeze({
+  everyone: {
+    everyone: true,
+    follower: true,
+    vip: true,
+    mod: true,
+    bot: true,
+    streamer: true,
+  },
+  followers: {
+    everyone: false,
+    follower: true,
+    vip: false,
+    mod: false,
+    subscriber: false,
+    artist: false,
+    bot: false,
+    streamer: false,
+  },
+  subs: {
+    everyone: false,
+    follower: true,
+    vip: false,
+    subscriber: true,
+    artist: false,
+    mod: false,
+    bot: false,
+    streamer: false,
+  },
+  mods: {
+    everyone: false,
+    follower: false,
+    vip: true,
+    mod: true,
+    subscriber: false,
+    artist: false,
+    bot: false,
+    streamer: true,
+  },
+})
+
+const KNOWN_BOT_USERNAMES = new Set([
+  'nightbot',
+  'streamelements',
+  'streamlabs',
+  'moobot',
+  'fossabot',
+  'sery_bot',
+  'wizebot',
+  'songlistbot',
+])
+
+const PERMISSION_ROLE_KEYS = Object.keys(DEFAULT_PERMISSION_ROLES)
+
+const normalizePermissionRoles = (permissionRoles, legacyPermissionLevel = '') => {
+  const nextRoles = { ...DEFAULT_PERMISSION_ROLES }
+  const hasPermissionRoleObject = Boolean(permissionRoles && typeof permissionRoles === 'object' && !Array.isArray(permissionRoles))
+
+  if (hasPermissionRoleObject) {
+    PERMISSION_ROLE_KEYS.forEach((roleKey) => {
+      if (Object.prototype.hasOwnProperty.call(permissionRoles, roleKey)) {
+        nextRoles[roleKey] = Boolean(permissionRoles[roleKey])
+      }
+    })
   }
+
+  const normalizedLegacy = String(legacyPermissionLevel || '').trim().toLowerCase()
+  const legacyRoles = LEGACY_PERMISSION_ROLE_MAP[normalizedLegacy]
+  const rolesAreDefault = PERMISSION_ROLE_KEYS.every(
+    (roleKey) => nextRoles[roleKey] === DEFAULT_PERMISSION_ROLES[roleKey],
+  )
+
+  if (legacyRoles && !hasPermissionRoleObject && rolesAreDefault) {
+    return { ...legacyRoles }
+  }
+
+  return nextRoles
+}
+
+const deriveLegacyPermissionLevelFromRoles = (permissionRoles) => {
+  const normalizedRoles = normalizePermissionRoles(permissionRoles)
+
+  if (normalizedRoles.everyone) {
+    return 'everyone'
+  }
+
+  if (
+    normalizedRoles.follower
+    && !normalizedRoles.vip
+    && !normalizedRoles.mod
+    && !normalizedRoles.bot
+    && !normalizedRoles.streamer
+  ) {
+    return 'followers'
+  }
+
+  if (
+    normalizedRoles.mod
+    && normalizedRoles.vip
+    && normalizedRoles.streamer
+    && !normalizedRoles.follower
+    && !normalizedRoles.bot
+  ) {
+    return 'mods'
+  }
+
+  return 'custom'
+}
+
+const resolveMessageRoles = ({
+  entry,
+  broadcasterLogin,
+  broadcasterId,
+  isFollower = false,
+}) => {
+  const safeBadges = entry?.badges && typeof entry.badges === 'object'
+    ? entry.badges
+    : {}
+
+  const normalizedEntryLogin = String(entry?.username || entry?.user || '').trim().toLowerCase()
+  const normalizedBroadcasterLogin = String(broadcasterLogin || '').trim().toLowerCase()
+  const entryUserId = String(entry?.userId || '').trim()
+  const broadcasterUserId = String(broadcasterId || '').trim()
+
+  const isStreamer = Boolean(safeBadges.broadcaster)
+    || Boolean(entryUserId && broadcasterUserId && entryUserId === broadcasterUserId)
+    || Boolean(normalizedEntryLogin && normalizedBroadcasterLogin && normalizedEntryLogin === normalizedBroadcasterLogin)
+  const isModerator = Boolean(safeBadges.moderator)
+  const isVip = Boolean(safeBadges.vip)
+  const isBot = Boolean(safeBadges.bot) || KNOWN_BOT_USERNAMES.has(normalizedEntryLogin)
+  const followerFromBadges = Boolean(
+    safeBadges.subscriber
+    || safeBadges.vip
+    || safeBadges.moderator
+    || safeBadges.broadcaster,
+  )
+
+  const isArtist = Object.keys(safeBadges || {}).some((k) => String(k || '').toLowerCase().includes('artist'))
+
+  return {
+    everyone: true,
+    follower: Boolean(isFollower || followerFromBadges || isStreamer),
+    subscriber: Boolean(safeBadges.subscriber),
+    vip: isVip,
+    mod: isModerator,
+    artist: Boolean(isArtist),
+    bot: isBot,
+    streamer: isStreamer,
+  }
+}
+
+const canSpeakByPermissionRoles = (permissionRoles, messageRoles) => {
+  const normalizedRoles = normalizePermissionRoles(permissionRoles)
+  if (normalizedRoles.everyone) {
+    return true
+  }
+
+  const safeMessageRoles = messageRoles && typeof messageRoles === 'object' ? messageRoles : {}
+  return PERMISSION_ROLE_KEYS.some((roleKey) => (
+    roleKey !== 'everyone'
+    && normalizedRoles[roleKey]
+    && Boolean(safeMessageRoles[roleKey])
+  ))
 }
 
 const hasLocaleStyleSupport = (voices, locale) => {
@@ -675,7 +1034,7 @@ function App() {
   const [accent, setAccent] = useState(defaultAccent)
   const [config, setConfig] = useState({})
   const [azureVoices, setAzureVoices] = useState([])
-  const [appVersion, setAppVersion] = useState('0.1.0')
+  const [appVersion, setAppVersion] = useState('0.2.0')
   const [isPaused, setIsPaused] = useState(false)
   const [saveState, setSaveState] = useState({ busy: false, label: 'SAVE SETTINGS' })
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
@@ -705,6 +1064,7 @@ function App() {
   const [saveFeedbackVisible, setSaveFeedbackVisible] = useState(false)
   const [showTtsOverlay, setShowTtsOverlay] = useState(false)
   const [isValidatingAzure, setIsValidatingAzure] = useState(false)
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false)
   const [isConfigReady, setIsConfigReady] = useState(false)
   const [isSetupOpen, setIsSetupOpen] = useState(false)
   const [setupKey, setSetupKey] = useState('')
@@ -746,13 +1106,25 @@ function App() {
     port: 8001,
     authenticated: false,
     error: '',
+    parameters: [],
   })
   const lastSavedSnapshotRef = useRef('')
   const isBootstrappedRef = useRef(false)
   const inputsSyncedRef = useRef(false)
   const lipSyncTimerRef = useRef(null)
   const lipSyncActiveRef = useRef(false)
-  const lastSpeakerRef = useRef(null)
+  const _lipSyncRuntimeRef = useRef({
+    speechKey: '',
+    frameIndex: 0,
+    frames: [],
+    channels: [],
+    lastAdditivePayload: [],
+    hasInjectedFrames: false,
+    startedAt: 0,
+    reachedFrameEnd: false,
+  })
+  const speakerMemoryRef = useRef({ lastSpeaker: null })
+  const activeTwitchIdentityRef = useRef('')
   const logsRef = useRef([])
   const logFlushTimerRef = useRef(null)
   const activeSectionRef = useRef(activeSection)
@@ -770,10 +1142,13 @@ function App() {
   const initialSnapshotSyncedRef = useRef(false)
   const allowWindowCloseRef = useRef(false)
   const processedRedemptionIdsRef = useRef(new Set())
+  const followerStatusCacheRef = useRef(new Map())
   const skipNextVoiceRefreshRef = useRef(false)
+  const vtsToastStateRef = useRef({ previousState: 'offline', attemptActive: false })
   const runtimeConfigRef = useRef(config)
   const rewardRulesRef = useRef(rewardRules)
   const userVoiceRulesRef = useRef(userVoiceRules)
+  const isPausedRef = useRef(isPaused)
   const appLanguage = config.app_lang || 'en'
   const performanceMode = config.performance_mode !== false
   const animationsEnabled = !performanceMode
@@ -1040,6 +1415,10 @@ function App() {
   }, [config])
 
   useEffect(() => {
+    isPausedRef.current = isPaused
+  }, [isPaused])
+
+  useEffect(() => {
     rewardRulesRef.current = rewardRules
   }, [rewardRules])
 
@@ -1077,7 +1456,36 @@ function App() {
   useEffect(() => {
     userAvatarCacheRef.current.clear()
     badgeCatalogRef.current = { global: null, channels: new Map() }
+    followerStatusCacheRef.current.clear()
   }, [config.twitch_oauth])
+
+  useEffect(() => {
+    const currentState = String(vtsConnection?.state || 'offline')
+    const toastState = vtsToastStateRef.current
+
+    if (currentState === 'connecting' || currentState === 'authorizing') {
+      toastState.attemptActive = true
+    }
+
+    if (toastState.previousState !== currentState) {
+      if (currentState === 'connected' && toastState.attemptActive) {
+        pushToast(t('vts_connect_success', 'VTube Studio connected successfully.'), 'success')
+        toastState.attemptActive = false
+      }
+
+      if ((currentState === 'error' || currentState === 'denied') && toastState.attemptActive) {
+        const errorCode = String(vtsConnection?.error || 'vts_connection_failed').trim() || 'vts_connection_failed'
+        const errorText = t(errorCode, errorCode)
+        const details = errorText && errorText !== errorCode
+          ? ` (${errorCode}: ${errorText})`
+          : ` (${errorCode})`
+        pushToast(`${t('vts_connect_failed', 'VTube Studio connection failed.')}${details}`, 'error')
+        toastState.attemptActive = false
+      }
+    }
+
+    toastState.previousState = currentState
+  }, [pushToast, t, vtsConnection?.error, vtsConnection?.state])
 
   const normalizeTwitchToken = useCallback((token) => String(token || '')
     .trim()
@@ -1250,15 +1658,92 @@ function App() {
     }
   }, [resolveBadgeImages, resolveUserAvatar])
 
-  const buildProcessedChatPayload = useCallback((entry) => {
+  const resolveFollowerStatus = useCallback(async (entry) => {
+    const roomId = String(entry?.roomId || runtimeConfigRef.current?.twitch_user_id || '').trim()
+    const userId = String(entry?.userId || '').trim()
+
+    if (!roomId || !userId) {
+      return false
+    }
+
+    if (roomId === userId) {
+      return true
+    }
+
+    const cacheKey = `${roomId}:${userId}`
+    const now = Date.now()
+    const cached = followerStatusCacheRef.current.get(cacheKey)
+    if (cached && cached.expiresAt > now) {
+      return Boolean(cached.value)
+    }
+
+    const token = normalizeTwitchToken(runtimeConfigRef.current?.twitch_oauth || '')
+    if (!token || !TWITCH_CLIENT_ID) {
+      followerStatusCacheRef.current.set(cacheKey, {
+        value: false,
+        expiresAt: now + FOLLOWER_CACHE_ERROR_TTL_MS,
+      })
+      return false
+    }
+
+    try {
+      const endpoint = new URL('https://api.twitch.tv/helix/channels/followers')
+      endpoint.searchParams.set('broadcaster_id', roomId)
+      endpoint.searchParams.set('user_id', userId)
+
+      const response = await fetch(endpoint.toString(), {
+        headers: {
+          'Client-ID': TWITCH_CLIENT_ID,
+          Authorization: `Bearer ${token}`,
+        },
+      })
+
+      const failedRequestTtl = response.status === 401 || response.status === 403
+        ? FOLLOWER_CACHE_TTL_MS
+        : FOLLOWER_CACHE_ERROR_TTL_MS
+
+      if (!response.ok) {
+        followerStatusCacheRef.current.set(cacheKey, {
+          value: false,
+          expiresAt: now + failedRequestTtl,
+        })
+        return false
+      }
+
+      const payload = await response.json()
+      const isFollower = Number(payload?.total ?? 0) > 0
+        || (Array.isArray(payload?.data) && payload.data.length > 0)
+
+      followerStatusCacheRef.current.set(cacheKey, {
+        value: isFollower,
+        expiresAt: now + FOLLOWER_CACHE_TTL_MS,
+      })
+      return isFollower
+    } catch {
+      followerStatusCacheRef.current.set(cacheKey, {
+        value: false,
+        expiresAt: now + FOLLOWER_CACHE_ERROR_TTL_MS,
+      })
+      return false
+    }
+  }, [normalizeTwitchToken])
+
+  const buildProcessedChatPayload = useCallback(async (entry) => {
     const currentConfig = runtimeConfigRef.current || {}
     const currentRewardRules = rewardRulesRef.current || {}
     const currentUserVoiceRules = userVoiceRulesRef.current || {}
     const user = String(entry?.user || '').trim() || 'unknown'
     const normalizedUser = user.toLowerCase()
+    const speakerMemory = speakerMemoryRef.current || { lastSpeaker: null }
     const rewardRule = entry?.rewardId ? currentRewardRules?.[entry.rewardId] : null
     const userRule = currentUserVoiceRules?.[normalizedUser] || null
     const hasFixedRewardText = Boolean(rewardRule?.useFixText && String(rewardRule.customText || '').trim())
+    const isRewardMessage = Boolean(entry?.rewardId)
+
+    // Allow rewards regardless of chat TTS setting; only block regular chat if disabled
+    if (!isRewardMessage && !currentConfig.read_chat_messages) {
+      return null
+    }
 
     const blockedUsers = Array.isArray(currentConfig.blacklist)
       ? currentConfig.blacklist.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)
@@ -1279,17 +1764,19 @@ function App() {
       processedText = stripTwitchEmoteRanges(processedText, entry?.emotes)
     }
 
-    if (currentConfig.filter_links && LINK_PATTERN.test(processedText)) {
-      return null
-    }
+    if (!hasFixedRewardText) {
+      if (currentConfig.filter_links && LINK_PATTERN.test(processedText)) {
+        return null
+      }
 
-    if (containsBlockedWord(processedText, currentConfig.word_blacklist)) {
-      return null
-    }
+      if (containsBlockedWord(processedText, currentConfig.word_blacklist)) {
+        return null
+      }
 
-    if (currentConfig.trim_repetition) {
-      const maxRepetition = Number.parseInt(String(currentConfig.max_repetition ?? 4), 10)
-      processedText = trimRepeatedCharacters(processedText, maxRepetition)
+      if (currentConfig.trim_repetition) {
+        const maxRepetition = Number.parseInt(String(currentConfig.max_repetition ?? 4), 10)
+        processedText = trimRepeatedCharacters(processedText, maxRepetition)
+      }
     }
 
     processedText = processedText.replace(/\s+/g, ' ').trim()
@@ -1297,7 +1784,39 @@ function App() {
       return null
     }
 
-    if (!canSpeakByPermissionLevel(currentConfig.permissionLevel, entry?.badges)) {
+    const permissionRoles = normalizePermissionRoles(
+      currentConfig.permission_roles,
+      currentConfig.permissionLevel,
+    )
+    const shouldResolveFollower = !permissionRoles.everyone && permissionRoles.follower
+    let isFollower = shouldResolveFollower
+      ? await resolveFollowerStatus(entry)
+      : false
+
+    // Fallback: if the follower API check returned false (or couldn't run) but the
+    // message carries badges that typically indicate a long-term relationship
+    // (subscriber, vip, moderator, broadcaster), treat the user as a follower
+    // for the purpose of permission checks. This avoids users with multiple
+    // roles being blocked when "followers only" is enabled.
+    try {
+      const badgeSet = entry?.badgeSet || entry?.badges || {}
+      const badgeIndicatesFollower = Boolean(
+        badgeSet?.subscriber || badgeSet?.vip || badgeSet?.moderator || badgeSet?.broadcaster,
+      )
+      if (!isFollower && badgeIndicatesFollower) {
+        isFollower = true
+      }
+    } catch {
+      // ignore
+    }
+    const messageRoles = resolveMessageRoles({
+      entry,
+      broadcasterLogin: currentConfig.twitch_username,
+      broadcasterId: currentConfig.twitch_user_id,
+      isFollower,
+    })
+
+    if (!isRewardMessage && !canSpeakByPermissionRoles(permissionRoles, messageRoles)) {
       return null
     }
 
@@ -1331,17 +1850,17 @@ function App() {
 
     if (nameStyle === 'always') {
       ttsText = `${user} mondja: ${processedText}`
-      lastSpeakerRef.current = user
+      speakerMemory.lastSpeaker = user
     } else if (nameStyle === 'new_speaker') {
-      if (lastSpeakerRef.current !== user) {
+      if (speakerMemory.lastSpeaker !== user) {
         ttsText = `${user} mondja: ${processedText}`
-        lastSpeakerRef.current = user
+        speakerMemory.lastSpeaker = user
       }
     } else if (nameStyle === 'never') {
-      lastSpeakerRef.current = user
+      speakerMemory.lastSpeaker = user
     } else {
       ttsText = `${user} mondja: ${processedText}`
-      lastSpeakerRef.current = user
+      speakerMemory.lastSpeaker = user
     }
 
     return {
@@ -1353,7 +1872,21 @@ function App() {
       appliesUserRule,
       hasFixedRewardText,
     }
-  }, [])
+  }, [resolveFollowerStatus])
+
+  useEffect(() => {
+    const identity = `${String(config.twitch_user_id || '').trim()}:${String(config.twitch_username || '').trim().toLowerCase()}`
+    if (!activeTwitchIdentityRef.current) {
+      activeTwitchIdentityRef.current = identity
+      return
+    }
+
+    if (activeTwitchIdentityRef.current !== identity) {
+      speakerMemoryRef.current = { lastSpeaker: null }
+      followerStatusCacheRef.current.clear()
+      activeTwitchIdentityRef.current = identity
+    }
+  }, [config.twitch_user_id, config.twitch_username])
 
   const flushLogs = useCallback(() => {
     if (logFlushTimerRef.current) {
@@ -1554,6 +2087,11 @@ function App() {
         const nextOverlayShowStatus = loadedConfig.overlay_show_status ?? true
         const nextOverlayShowTtsStatus = loadedConfig.overlay_show_tts_status ?? nextOverlayShowStatus
         const nextOverlayShowTwitchStatus = loadedConfig.overlay_show_twitch_status ?? nextOverlayShowStatus
+        const nextPermissionRoles = normalizePermissionRoles(
+          loadedConfig.permission_roles,
+          loadedConfig.permissionLevel,
+        )
+        const nextPermissionLevel = deriveLegacyPermissionLevelFromRoles(nextPermissionRoles)
         const twitchUserId = String(loadedConfig.twitch_user_id || '')
         let nextRewardRulesByUser = {
           ...normalizeRewardRulesByUser(loadedConfig.reward_rules_by_user),
@@ -1579,22 +2117,29 @@ function App() {
           reward_rules: nextRewardRules,
           reward_rules_by_user: nextRewardRulesByUser,
           twitch_user_id: twitchUserId,
+          read_chat_messages: Boolean(loadedConfig.read_chat_messages),
+          permission_roles: nextPermissionRoles,
+          permissionLevel: nextPermissionLevel,
           presets: nextPresets,
           active_preset_id: loadedConfig.active_preset_id || '',
           hotkeys: nextHotkeys,
+          tray_enabled: Boolean(loadedConfig.tray_enabled),
           overlay_layout: nextOverlayLayout,
           overlay_resolution: nextOverlayResolution,
           overlay_show_chat: false,
           overlay_show_tts_status: Boolean(nextOverlayShowTtsStatus),
           overlay_show_twitch_status: Boolean(nextOverlayShowTwitchStatus),
           overlay_show_status: Boolean(nextOverlayShowTtsStatus || nextOverlayShowTwitchStatus),
+          vts_mouth_open_enabled: loadedConfig.vts_mouth_open_enabled !== false,
+          vts_mouth_smile_enabled: loadedConfig.vts_mouth_smile_enabled !== false,
+          vts_jaw_open_enabled: loadedConfig.vts_jaw_open_enabled !== false,
           onboarding_complete: Boolean(loadedConfig.onboarding_complete),
         })
         setRewardRules(nextRewardRules)
         setUserVoiceRules(loadedConfig.user_voices || {})
         setTheme(normalizedTheme)
         setAccent(nextAccent)
-        setAppVersion(loadedVersion || '0.1.0')
+        setAppVersion(loadedVersion || '0.2.0')
         setSetupRegion(loadedConfig.azure_region || 'westeurope')
         setSetupKey('')
         setIsSetupOpen(needsSetup)
@@ -1614,11 +2159,13 @@ function App() {
           twitch_oauth: loadedConfig.twitch_oauth || '',
           app_lang: loadedConfig.app_lang || 'en',
           language_filter: loadedConfig.language_filter || 'en-US',
+          read_chat_messages: Boolean(loadedConfig.read_chat_messages),
           read_emotes: Boolean(loadedConfig.read_emotes),
           filter_links: Boolean(loadedConfig.filter_links),
           trim_repetition: Boolean(loadedConfig.trim_repetition),
           max_repetition: Number.parseInt(String(loadedConfig.max_repetition ?? 4), 10) || 4,
-          permissionLevel: String(loadedConfig.permissionLevel || 'everyone'),
+          permission_roles: nextPermissionRoles,
+          permissionLevel: nextPermissionLevel,
           nameStyle: String(loadedConfig.nameStyle || 'always'),
           word_blacklist: Array.isArray(loadedConfig.word_blacklist) ? loadedConfig.word_blacklist : [],
           blacklist: Array.isArray(loadedConfig.blacklist) ? loadedConfig.blacklist : [],
@@ -1633,6 +2180,18 @@ function App() {
           vts_enabled: Boolean(loadedConfig.vts_enabled),
           vts_port: Number.parseInt(String(loadedConfig.vts_port ?? 8001), 10) || 8001,
           vts_auth_token: loadedConfig.vts_auth_token || '',
+          vts_mouth_open_enabled: loadedConfig.vts_mouth_open_enabled !== false,
+          vts_mouth_smile_enabled: loadedConfig.vts_mouth_smile_enabled !== false,
+          vts_mouth_open_param: String(loadedConfig.vts_mouth_open_param || 'MouthOpen'),
+          vts_mouth_open_min: Number.isFinite(Number(loadedConfig.vts_mouth_open_min)) ? Number(loadedConfig.vts_mouth_open_min) : 0,
+          vts_mouth_open_max: Number.isFinite(Number(loadedConfig.vts_mouth_open_max)) ? Number(loadedConfig.vts_mouth_open_max) : 1,
+          vts_mouth_smile_param: String(loadedConfig.vts_mouth_smile_param || 'MouthSmile'),
+          vts_mouth_smile_min: Number.isFinite(Number(loadedConfig.vts_mouth_smile_min)) ? Number(loadedConfig.vts_mouth_smile_min) : 0,
+          vts_mouth_smile_max: Number.isFinite(Number(loadedConfig.vts_mouth_smile_max)) ? Number(loadedConfig.vts_mouth_smile_max) : 1,
+          vts_jaw_open_enabled: loadedConfig.vts_jaw_open_enabled !== false,
+          vts_jaw_open_param: String(loadedConfig.vts_jaw_open_param || 'JawOpen'),
+          vts_jaw_open_min: Number.isFinite(Number(loadedConfig.vts_jaw_open_min)) ? Number(loadedConfig.vts_jaw_open_min) : 0,
+          vts_jaw_open_max: Number.isFinite(Number(loadedConfig.vts_jaw_open_max)) ? Number(loadedConfig.vts_jaw_open_max) : 1,
           reward_rules: nextRewardRules,
           reward_rules_by_user: nextRewardRulesByUser,
           user_voices: loadedConfig.user_voices || {},
@@ -1640,6 +2199,7 @@ function App() {
           accent_primary: nextAccent.primary,
           accent_secondary: nextAccent.secondary,
           performance_mode: loadedConfig.performance_mode ?? true,
+          tray_enabled: Boolean(loadedConfig.tray_enabled),
           presets: nextPresets,
           active_preset_id: loadedConfig.active_preset_id || '',
           hotkeys: nextHotkeys,
@@ -2070,44 +2630,119 @@ function App() {
       lipSyncTimerRef.current = null
     }
 
-    if (lipSyncActiveRef.current) {
-      lipSyncActiveRef.current = false
-      injectVtsMouth(0)
+    lipSyncActiveRef.current = false
+    _lipSyncRuntimeRef.current = {
+      speechKey: '',
+      frameIndex: 0,
+      frames: [],
+      channels: [],
+      lastAdditivePayload: [],
+      hasInjectedFrames: false,
+      startedAt: 0,
+      reachedFrameEnd: false,
     }
+    // Do NOT send any reset/neutral values here—the interval already sends neutral for enabled channels at frame end
   }, [])
 
-  const startLipSync = useCallback(() => {
+  const startLipSync = useCallback((text, rateInput, startedAtMs) => {
     if (lipSyncTimerRef.current) {
       window.clearInterval(lipSyncTimerRef.current)
       lipSyncTimerRef.current = null
     }
 
+    const textValue = String(text || '').trim()
+    const rate = String(rateInput || runtimeConfigRef.current.global_speed || '1.0')
+    const frames = _buildLipFramesFromText(textValue, rate)
+
+    const channels = []
+    if (runtimeConfigRef.current.vts_mouth_open_enabled) {
+      channels.push({ key: 'mouthOpen', id: String(runtimeConfigRef.current.vts_mouth_open_param || 'MouthOpen'), min: Number(runtimeConfigRef.current.vts_mouth_open_min || 0), max: Number(runtimeConfigRef.current.vts_mouth_open_max || 1) })
+    }
+    if (runtimeConfigRef.current.vts_mouth_smile_enabled) {
+      channels.push({ key: 'mouthSmile', id: String(runtimeConfigRef.current.vts_mouth_smile_param || 'MouthSmile'), min: Number(runtimeConfigRef.current.vts_mouth_smile_min || 0), max: Number(runtimeConfigRef.current.vts_mouth_smile_max || 1) })
+    }
+    if (runtimeConfigRef.current.vts_jaw_open_enabled) {
+      channels.push({ key: 'jawOpen', id: String(runtimeConfigRef.current.vts_jaw_open_param || 'JawOpen'), min: Number(runtimeConfigRef.current.vts_jaw_open_min || 0), max: Number(runtimeConfigRef.current.vts_jaw_open_max || 1) })
+    }
+
+    _lipSyncRuntimeRef.current = {
+      speechKey: `${Date.now()}`,
+      frameIndex: 0,
+      frames,
+      channels,
+      lastAdditivePayload: [],
+      hasInjectedFrames: false,
+      startedAt: Number(startedAtMs) || Date.now(),
+      reachedFrameEnd: false,
+    }
+
     lipSyncActiveRef.current = true
+
     lipSyncTimerRef.current = window.setInterval(() => {
-      const pulseValue = 0.1 + Math.random() * 0.5
-      injectVtsMouth(pulseValue)
-    }, 180)
-  }, [])
+      const runtime = _lipSyncRuntimeRef.current
+      if (!runtime || !runtime.frames || !runtime.frames.length) return
+
+      const now = Date.now()
+      const elapsed = Math.max(0, now - Number(runtime.startedAt || now))
+      const frameIdx = Math.floor(elapsed / VTS_LIP_SYNC_INTERVAL_MS)
+
+      if (frameIdx >= runtime.frames.length) {
+        // end of frames
+        if (!runtime.reachedFrameEnd) {
+          runtime.reachedFrameEnd = true
+          // send neutral values once
+          const payload = runtime.channels.map((ch) => ({ id: ch.id, value: ch.min }))
+          try { injectVtsParameters(payload) } catch { /* noop */ }
+        }
+        stopLipSync()
+        return
+      }
+
+      const frame = runtime.frames[frameIdx]
+      const parameterValues = runtime.channels.map((ch) => {
+        const raw = Number(frame?.[ch.key] || 0)
+        const scaled = Number(ch.min) + (Number(ch.max) - Number(ch.min)) * clampToRange(raw, 0, 1)
+        return { id: ch.id, value: scaled }
+      })
+
+      try { injectVtsParameters(parameterValues) } catch { /* noop */ }
+    }, VTS_LIP_SYNC_INTERVAL_MS)
+  }, [stopLipSync])
 
   useEffect(() => {
+    const hasPlaybackStartTimestamp = Number.isFinite(Number(ttsState.startedAt)) && Number(ttsState.startedAt) > 0
     const shouldAnimateMouth = Boolean(config.vts_enabled)
       && vtsConnection.state === 'connected'
       && ttsState.status === 'PLAYING'
+      && hasPlaybackStartTimestamp
 
     if (!shouldAnimateMouth) {
       stopLipSync()
       return
     }
 
-    startLipSync()
+    // Start lip-sync using the current TTS text, rate and actual playback start time from backend
+    startLipSync(ttsState.currentText, ttsState.currentOptions?.rate, ttsState.startedAt)
 
     return () => {
       stopLipSync()
     }
-  }, [config.vts_enabled, vtsConnection.state, ttsState.status, startLipSync, stopLipSync])
+  }, [
+    config.vts_enabled,
+    config.vts_mouth_open_enabled,
+    config.vts_mouth_smile_enabled,
+    config.vts_jaw_open_enabled,
+    vtsConnection.state,
+    ttsState.status,
+    ttsState.currentText,
+    ttsState.startedAt,
+    ttsState.currentOptions,
+    startLipSync,
+    stopLipSync,
+  ])
 
-  const handleIncomingTwitchEntry = useCallback((entry) => {
-    const processed = buildProcessedChatPayload(entry)
+  const handleIncomingTwitchEntry = useCallback(async (entry) => {
+    const processed = await buildProcessedChatPayload(entry)
     if (!processed) return false
 
     const sourceText = typeof entry?.text === 'string'
@@ -2163,7 +2798,6 @@ function App() {
     const username = config.twitch_username || ''
 
     if (!token || !username) {
-      lastSpeakerRef.current = null
       window.setTimeout(() => {
         setTwitchConnection({ state: 'offline', username: '' })
       }, 0)
@@ -2185,7 +2819,7 @@ function App() {
           },
           onLog: (entry) => {
             if (disposed) return
-            handleIncomingTwitchEntry(entry)
+            void handleIncomingTwitchEntry(entry)
           },
         })
       } catch (error) {
@@ -2200,7 +2834,6 @@ function App() {
 
     return () => {
       disposed = true
-      lastSpeakerRef.current = null
       void stopTwitchBot()
     }
   }, [config.twitch_oauth, config.twitch_username, handleIncomingTwitchEntry])
@@ -2261,7 +2894,7 @@ function App() {
           const userInput = String(redemption?.user_input || '')
           const redeemedAt = String(redemption?.redeemed_at || '').trim()
 
-          const accepted = handleIncomingTwitchEntry({
+          const accepted = await handleIncomingTwitchEntry({
             id: `redemption-${redemptionId}`,
             user: userName,
             username: userLogin,
@@ -2272,6 +2905,7 @@ function App() {
             badges: {},
             badgeSet: {},
             emotes: null,
+            userId: String(redemption?.user_id || ''),
           })
 
           if (accepted) {
@@ -2329,15 +2963,26 @@ function App() {
       twitch_user_id: String(resolvedConfig.twitch_user_id || ''),
       app_lang: readInputNonEmpty('app_lang_select', resolvedConfig.app_lang || 'en'),
       language_filter: readInputNonEmpty('language_filter', resolvedConfig.language_filter || 'en-US'),
+      read_chat_messages: Boolean(resolvedConfig.read_chat_messages),
       read_emotes: Boolean(resolvedConfig.read_emotes),
       filter_links: Boolean(resolvedConfig.filter_links),
       trim_repetition: Boolean(resolvedConfig.trim_repetition),
       max_repetition: Number.parseInt(String(resolvedConfig.max_repetition ?? 4), 10) || 4,
-      permissionLevel: String(resolvedConfig.permissionLevel || 'everyone'),
+      permission_roles: normalizePermissionRoles(
+        resolvedConfig.permission_roles,
+        resolvedConfig.permissionLevel,
+      ),
+      permissionLevel: deriveLegacyPermissionLevelFromRoles(
+        normalizePermissionRoles(
+          resolvedConfig.permission_roles,
+          resolvedConfig.permissionLevel,
+        ),
+      ),
       nameStyle: String(resolvedConfig.nameStyle || 'always'),
       word_blacklist: Array.isArray(resolvedConfig.word_blacklist) ? resolvedConfig.word_blacklist : [],
       blacklist: Array.isArray(resolvedConfig.blacklist) ? resolvedConfig.blacklist : [],
       obs_server_enabled: Boolean(resolvedConfig.obs_server_enabled),
+      tray_enabled: Boolean(resolvedConfig.tray_enabled),
       overlay_show_chat: false,
       overlay_show_status: Boolean(overlayShowTtsStatus || overlayShowTwitchStatus),
       overlay_show_tts_status: overlayShowTtsStatus,
@@ -2351,6 +2996,18 @@ function App() {
         || Number.parseInt(String(resolvedConfig.vts_port ?? 8001), 10)
         || 8001,
       vts_auth_token: resolvedConfig.vts_auth_token || '',
+      vts_mouth_open_enabled: resolvedConfig.vts_mouth_open_enabled !== false,
+      vts_mouth_open_param: String(resolvedConfig.vts_mouth_open_param || 'MouthOpen'),
+      vts_mouth_open_min: Number.isFinite(Number(resolvedConfig.vts_mouth_open_min)) ? Number(resolvedConfig.vts_mouth_open_min) : 0,
+      vts_mouth_open_max: Number.isFinite(Number(resolvedConfig.vts_mouth_open_max)) ? Number(resolvedConfig.vts_mouth_open_max) : 1,
+      vts_mouth_smile_enabled: resolvedConfig.vts_mouth_smile_enabled !== false,
+      vts_mouth_smile_param: String(resolvedConfig.vts_mouth_smile_param || 'MouthSmile'),
+      vts_mouth_smile_min: Number.isFinite(Number(resolvedConfig.vts_mouth_smile_min)) ? Number(resolvedConfig.vts_mouth_smile_min) : 0,
+      vts_mouth_smile_max: Number.isFinite(Number(resolvedConfig.vts_mouth_smile_max)) ? Number(resolvedConfig.vts_mouth_smile_max) : 1,
+      vts_jaw_open_enabled: resolvedConfig.vts_jaw_open_enabled !== false,
+      vts_jaw_open_param: String(resolvedConfig.vts_jaw_open_param || 'JawOpen'),
+      vts_jaw_open_min: Number.isFinite(Number(resolvedConfig.vts_jaw_open_min)) ? Number(resolvedConfig.vts_jaw_open_min) : 0,
+      vts_jaw_open_max: Number.isFinite(Number(resolvedConfig.vts_jaw_open_max)) ? Number(resolvedConfig.vts_jaw_open_max) : 1,
       reward_rules: overrides.reward_rules ?? rewardRules,
       reward_rules_by_user: overrides.reward_rules_by_user
         ?? normalizeRewardRulesByUser(resolvedConfig.reward_rules_by_user),
@@ -2402,6 +3059,11 @@ function App() {
     const nextPresets = Array.isArray(refreshed.presets) ? refreshed.presets : []
     const nextHotkeys = normalizeHotkeys(refreshed.hotkeys)
     const nextActivePresetId = String(refreshed.active_preset_id || '')
+    const nextPermissionRoles = normalizePermissionRoles(
+      refreshed.permission_roles,
+      refreshed.permissionLevel,
+    )
+    const nextPermissionLevel = deriveLegacyPermissionLevelFromRoles(nextPermissionRoles)
 
     setConfig({
       ...refreshed,
@@ -2411,6 +3073,10 @@ function App() {
       presets: nextPresets,
       active_preset_id: nextActivePresetId,
       hotkeys: nextHotkeys,
+      read_chat_messages: Boolean(refreshed.read_chat_messages),
+      permission_roles: nextPermissionRoles,
+      permissionLevel: nextPermissionLevel,
+      tray_enabled: Boolean(refreshed.tray_enabled),
       onboarding_complete: Boolean(refreshed.onboarding_complete),
       overlay_layout: nextOverlayLayout,
       overlay_show_tts_status: Boolean(nextOverlayShowTtsStatus),
@@ -2435,6 +3101,9 @@ function App() {
         hotkeys: nextHotkeys,
         onboarding_complete: Boolean(refreshed.onboarding_complete),
         twitch_user_id: refreshedUserId,
+        read_chat_messages: Boolean(refreshed.read_chat_messages),
+        permission_roles: nextPermissionRoles,
+        permissionLevel: nextPermissionLevel,
         overlay_layout: nextOverlayLayout,
         overlay_show_tts_status: Boolean(nextOverlayShowTtsStatus),
         overlay_show_twitch_status: Boolean(nextOverlayShowTwitchStatus),
@@ -3073,6 +3742,36 @@ function App() {
     }))
   }
 
+  const handlePermissionRoleToggle = useCallback((roleKey, enabled) => {
+    if (!roleKey) return
+
+    setConfig((previous) => {
+      const currentRoles = normalizePermissionRoles(previous.permission_roles, previous.permissionLevel)
+      const isEnabled = Boolean(enabled)
+      const nextRoles = { ...currentRoles }
+
+      if (roleKey === 'everyone') {
+        PERMISSION_ROLE_KEYS.forEach((key) => {
+          nextRoles[key] = isEnabled
+        })
+      } else {
+        nextRoles[roleKey] = isEnabled
+        nextRoles.everyone = isEnabled
+          && PERMISSION_ROLE_KEYS.filter((key) => key !== 'everyone').every((key) => Boolean(nextRoles[key]))
+
+        if (!isEnabled) {
+          nextRoles.everyone = false
+        }
+      }
+
+      return {
+        ...previous,
+        permission_roles: nextRoles,
+        permissionLevel: deriveLegacyPermissionLevelFromRoles(nextRoles),
+      }
+    })
+  }, [])
+
   const handleMaxRepetitionChange = (nextValue) => {
     const numericValue = Number.parseInt(String(nextValue), 10)
     const safeValue = Number.isFinite(numericValue)
@@ -3176,12 +3875,83 @@ function App() {
     }))
   }
 
+  const handleVtsMappingChange = useCallback((key, value) => {
+    if (!key) return
+
+    setConfig((previous) => ({
+      ...previous,
+      [key]: String(value || '').trim(),
+    }))
+  }, [])
+
+  const handleVtsChannelToggle = useCallback((key, enabled) => {
+    if (!key) return
+
+    setConfig((previous) => ({
+      ...previous,
+      [key]: Boolean(enabled),
+    }))
+  }, [])
+
+  const handleVtsRangeChange = useCallback((key, value) => {
+    if (!key) return
+
+    const parsed = Number.parseFloat(String(value))
+    if (!Number.isFinite(parsed)) return
+
+    const counterpartByKey = {
+      vts_mouth_open_min: 'vts_mouth_open_max',
+      vts_mouth_open_max: 'vts_mouth_open_min',
+      vts_mouth_smile_min: 'vts_mouth_smile_max',
+      vts_mouth_smile_max: 'vts_mouth_smile_min',
+      vts_jaw_open_min: 'vts_jaw_open_max',
+      vts_jaw_open_max: 'vts_jaw_open_min',
+    }
+    const counterpartKey = counterpartByKey[key] || ''
+
+    setConfig((previous) => {
+      const next = {
+        ...previous,
+        [key]: parsed,
+      }
+
+      if (counterpartKey) {
+        const counterpartValue = Number(next[counterpartKey])
+        if (Number.isFinite(counterpartValue)) {
+          if (key.endsWith('_min') && parsed > counterpartValue) {
+            next[counterpartKey] = parsed
+          }
+          if (key.endsWith('_max') && parsed < counterpartValue) {
+            next[counterpartKey] = parsed
+          }
+        }
+      }
+
+      return next
+    })
+  }, [])
+
+  const handleRefreshVtsParameters = useCallback(() => {
+    if (vtsConnection.state !== 'connected') {
+      pushToast(t('vts_socket_error', 'VTube Studio is not reachable. Start VTS and check the port.'), 'error')
+      return
+    }
+
+    const refreshed = requestVtsParameters()
+    if (refreshed) {
+      pushToast(t('vts_refresh_success', 'Model variables refreshed successfully'), 'success')
+      return
+    }
+
+    pushToast(t('vts_refresh_failed', 'Could not refresh the model variables.'), 'error')
+  }, [pushToast, t, vtsConnection.state])
+
   const handleToggleVtsConnection = () => {
     const port = Number.parseInt(getInputValue('vts-port', String(config.vts_port ?? 8001)), 10) || 8001
     const isBusy = vtsConnection.state === 'connecting' || vtsConnection.state === 'authorizing'
     const isConnected = vtsConnection.state === 'connected'
 
-    if (isBusy || isConnected) {
+    if (isConnected || isBusy) {
       disconnectVts()
       return
     }
@@ -3359,7 +4129,29 @@ function App() {
     })
   }, [t])
 
-  const handleRequestCloseApp = useCallback(() => {
+  const sendAppToTray = useCallback(async () => {
+    if (!isTauriRuntime()) return
+
+    const labels = {
+      settings: t('tray_settings', 'Settings'),
+      exit: t('tray_exit', 'Exit'),
+    }
+
+    const result = await sendToTray(labels)
+    if (!result?.success) {
+      void hideWindow()
+    }
+  }, [t])
+
+  const handleRequestCloseApp = useCallback((options = {}) => {
+    const forceExitConfirm = Boolean(options?.forceExitConfirm)
+    const trayEnabled = Boolean(runtimeConfigRef.current?.tray_enabled)
+
+    if (trayEnabled && !forceExitConfirm) {
+      void sendAppToTray()
+      return
+    }
+
     setSecurityModal((previous) => {
       if (previous?.open && previous?.action === 'close_app') {
         return previous
@@ -3374,7 +4166,7 @@ function App() {
         confirmLabel: t('tooltip_close'),
       }
     })
-  }, [t])
+  }, [sendAppToTray, t])
 
   useEffect(() => {
     if (!isTauriRuntime()) return undefined
@@ -3384,6 +4176,14 @@ function App() {
 
     const attach = async () => {
       const cleanup = await onWindowCloseRequested((event) => {
+        const trayEnabled = Boolean(runtimeConfigRef.current?.tray_enabled)
+
+        if (trayEnabled && !allowWindowCloseRef.current) {
+          event?.preventDefault?.()
+          void sendAppToTray()
+          return
+        }
+
         if (allowWindowCloseRef.current) {
           allowWindowCloseRef.current = false
           return
@@ -3409,7 +4209,59 @@ function App() {
         unlisten()
       }
     }
-  }, [handleRequestCloseApp])
+  }, [handleRequestCloseApp, sendAppToTray])
+
+  useEffect(() => {
+    if (!isTauriRuntime() || !isConfigReady) return undefined
+
+    let disposed = false
+    const labels = {
+      settings: t('tray_settings', 'Settings'),
+      exit: t('tray_exit', 'Exit'),
+    }
+
+    const syncTrayState = async () => {
+      const trayResult = await setTrayEnabled(Boolean(config.tray_enabled), labels)
+      if (disposed) return
+
+      const effectiveEnabled = Boolean(trayResult?.enabled)
+      if (effectiveEnabled !== Boolean(config.tray_enabled)) {
+        setConfig((previous) => ({
+          ...previous,
+          tray_enabled: effectiveEnabled,
+        }))
+      }
+
+      await updateTrayLanguage(labels)
+    }
+
+    void syncTrayState()
+
+    return () => {
+      disposed = true
+    }
+  }, [config.tray_enabled, isConfigReady, t])
+
+  useEffect(() => {
+    if (!isTauriRuntime() || !isConfigReady) return undefined
+
+    let disposed = false
+
+    const syncGlobalHotkeys = async () => {
+      const result = await setGlobalHotkeys(hotkeys)
+      if (disposed) return
+
+      if (!result?.success && Array.isArray(result?.failed) && result.failed.length > 0) {
+        console.warn('[global-hotkeys] failed registrations', result.failed)
+      }
+    }
+
+    void syncGlobalHotkeys()
+
+    return () => {
+      disposed = true
+    }
+  }, [hotkeys, isConfigReady])
 
   const validateAzureConfig = useCallback(async (azureKey, azureRegion, { showStatus = true } = {}) => {
     hideMessageBox('azure-status-box')
@@ -3503,21 +4355,6 @@ function App() {
     setIsSetupSaving(false)
   }
 
-  const handleOnboardingDone = async () => {
-    const result = await saveConfig({
-      ...collectConfigPayload(),
-      onboarding_complete: true,
-    })
-
-    if (!result?.success) {
-      pushToast(t('toast_onboarding_save_failed', 'Could not complete onboarding. Please try again.'), 'error')
-      return
-    }
-
-    const refreshed = await getConfig()
-    applyRefreshedConfig(refreshed)
-  }
-
   const handleSave = async () => {
     if (saveFeedbackTimerRef.current) {
       window.clearTimeout(saveFeedbackTimerRef.current)
@@ -3545,7 +4382,7 @@ function App() {
     if (result?.source === 'azure') {
       pushToast(t(result.error || 'err_azure_invalid'), 'error')
     } else if (result?.source === 'twitch') {
-      showMessageBox('twitch-error-box', 'twitch-error-text', t(result.error || 'err_twitch_invalid'))
+      pushToast(t(result.error || 'err_twitch_invalid'), 'error')
     }
 
     setSaveState({ busy: false, label: t('save_btn') })
@@ -3636,8 +4473,73 @@ function App() {
     await handleTestTts(options)
   }
 
+  const handleHotkeyAction = useCallback((action) => {
+    const normalizedAction = String(action || '').trim().toLowerCase()
+    if (!normalizedAction) return
+
+    if (normalizedAction === 'toggle_pause') {
+      if (isPausedRef.current) {
+        void resumeTtsQueue()
+      } else {
+        pauseTtsQueue()
+      }
+      return
+    }
+
+    if (normalizedAction === 'skip') {
+      skipTtsQueue()
+      return
+    }
+
+    if (normalizedAction === 'clear') {
+      clearTtsQueue()
+      return
+    }
+
+    if (normalizedAction === 'test_tts') {
+      void handleTestTts()
+    }
+  }, [handleTestTts])
+
   useEffect(() => {
+    if (!isTauriRuntime()) return undefined
+
+    let disposed = false
+    let cleanupExit = null
+    let cleanupHotkeys = null
+
+    const attach = async () => {
+      const unlistenExit = await onBackendEvent('tray-exit-request', () => {
+        handleRequestCloseApp({ forceExitConfirm: true })
+      })
+
+      const unlistenHotkeys = await onBackendEvent('global-hotkey-triggered', (payload) => {
+        handleHotkeyAction(payload?.action)
+      })
+
+      if (disposed) {
+        if (typeof unlistenExit === 'function') unlistenExit()
+        if (typeof unlistenHotkeys === 'function') unlistenHotkeys()
+        return
+      }
+
+      cleanupExit = unlistenExit
+      cleanupHotkeys = unlistenHotkeys
+    }
+
+    void attach()
+
+    return () => {
+      disposed = true
+      if (typeof cleanupExit === 'function') cleanupExit()
+      if (typeof cleanupHotkeys === 'function') cleanupHotkeys()
+    }
+  }, [handleHotkeyAction, handleRequestCloseApp])
+
+  useEffect(() => {
+    if (isTauriRuntime()) return undefined
     if (!hotkeys) return
+
     const handler = (event) => {
       if (isEditableTarget(event.target)) return
       const combo = getHotkeyStringFromEvent(event)
@@ -3648,29 +4550,25 @@ function App() {
 
       if (matches(hotkeys.toggle_pause)) {
         event.preventDefault()
-        if (isPaused) {
-          void resumeTtsQueue()
-        } else {
-          pauseTtsQueue()
-        }
+        handleHotkeyAction('toggle_pause')
         return
       }
 
       if (matches(hotkeys.skip)) {
         event.preventDefault()
-        skipTtsQueue()
+        handleHotkeyAction('skip')
         return
       }
 
       if (matches(hotkeys.clear)) {
         event.preventDefault()
-        clearTtsQueue()
+        handleHotkeyAction('clear')
         return
       }
 
       if (matches(hotkeys.test_tts)) {
         event.preventDefault()
-        void handleTestTts()
+        handleHotkeyAction('test_tts')
       }
     }
 
@@ -3678,7 +4576,7 @@ function App() {
     return () => {
       window.removeEventListener('keydown', handler)
     }
-  }, [hotkeys, isPaused, handleTestTts])
+  }, [handleHotkeyAction, hotkeys])
 
   const handleConnectTwitch = async () => {
     hideMessageBox('twitch-error-box')
@@ -3697,14 +4595,10 @@ function App() {
       ? { ...rewardRulesByUser, [previousUserId]: rewardRules }
       : rewardRulesByUser
 
-    const result = await twitchLogin(TWITCH_CLIENT_ID)
+    const result = await twitchLogin(TWITCH_CLIENT_ID, appLanguage, config.theme, config.accent_primary, config.accent_secondary)
 
     if (!result?.success || !result?.token) {
-      showMessageBox(
-        'twitch-error-box',
-        'twitch-error-text',
-        t(result?.error || 'err_twitch_invalid')
-      )
+      pushToast(t(result?.error || 'err_twitch_invalid'), 'error')
       setTwitchConnection({ state: 'offline', username: '' })
       return
     }
@@ -3729,7 +4623,7 @@ function App() {
     })
 
     if (!saveResult?.success) {
-      showMessageBox('twitch-error-box', 'twitch-error-text', t(saveResult?.error || 'err_twitch_invalid'))
+      pushToast(t(saveResult?.error || 'err_twitch_invalid'), 'error')
       setTwitchConnection({ state: 'offline', username: '' })
       return
     }
@@ -3795,6 +4689,13 @@ function App() {
 
   const handleThemeChange = (nextTheme) => {
     setTheme(nextTheme)
+  }
+
+  const handleTrayToggle = (enabled) => {
+    setConfig((previous) => ({
+      ...previous,
+      tray_enabled: Boolean(enabled),
+    }))
   }
 
   const handleAccentChange = (primary, secondary) => {
@@ -3974,18 +4875,17 @@ function App() {
     }
 
     pushToast(t('update_install_started', 'The installer has started. The application will close for update.'), 'success')
-  }, [downloadAndRunInstaller, pushToast, t, updateModal.installerName, updateModal.installerUrl])
+  }, [pushToast, t, updateModal.installerName, updateModal.installerUrl])
 
   useEffect(() => {
     if (hasAutoUpdateCheckRef.current) return
     if (!isConfigReady) return
     if (showLoader) return
     if (isSetupOpen) return
-    if (!config.onboarding_complete) return
 
     hasAutoUpdateCheckRef.current = true
     void checkForUpdates({ openModal: false, silentError: true })
-  }, [checkForUpdates, config.onboarding_complete, isConfigReady, isSetupOpen, showLoader])
+  }, [checkForUpdates, isConfigReady, isSetupOpen, showLoader])
 
   const handleSectionChange = (nextSection) => {
     setActiveSection(nextSection)
@@ -4022,13 +4922,11 @@ function App() {
     return `${baseUrl}/?token=${encodeURIComponent(overlayToken)}`
   }, [overlayToken])
   const showAzureSetup = isConfigReady && isSetupOpen
-  const showOnboarding = isConfigReady && !showAzureSetup && !config.onboarding_complete
   const showSaveIndicator = isConfigReady
     && isBootstrappedRef.current
     && inputsSyncedRef.current
     && (hasUnsavedChanges || saveFeedbackVisible)
     && !showAzureSetup
-    && !showOnboarding
   const showSaveSuccess = saveState.label === t('save_feedback_done', 'Saved')
 
   return (
@@ -4036,7 +4934,6 @@ function App() {
       <SetupOverlays
         t={t}
         showAzureSetup={showAzureSetup}
-        showOnboarding={showOnboarding}
         setupKey={setupKey}
         setupRegion={setupRegion}
         setupError={setupError}
@@ -4044,7 +4941,6 @@ function App() {
         onSetupKeyChange={setSetupKey}
         onSetupRegionChange={setSetupRegion}
         onSubmitSetup={handleSetupSubmit}
-        onOnboardingDone={handleOnboardingDone}
       />
       <UtilityOverlays
         showTtsOverlay={showTtsOverlay}
@@ -4095,14 +4991,18 @@ function App() {
             appVersion={appVersion}
             twitchConnection={twitchConnection}
             ttsState={ttsState}
+            trayEnabled={Boolean(config.tray_enabled)}
+            collapsed={isSidebarCollapsed}
+            onToggleCollapsed={() => setIsSidebarCollapsed((previous) => !previous)}
             t={t}
           />
 
           <main className={contentClassName}>
-            <div className="max-w-4xl mx-auto pb-10">
+            <div className={`mx-auto pb-10 ${isSidebarCollapsed ? 'max-w-5xl' : 'max-w-4xl'}`}>
               <SectionRenderer
                 activeSection={activeSection}
                 t={t}
+                projectGithubUrl={PROJECT_GITHUB_URL}
                 appLang={appLanguage}
                 onLanguageChange={handleLanguageChange}
                 onValidateAzure={handleValidateAzure}
@@ -4113,6 +5013,8 @@ function App() {
                 onAccentChange={handleAccentChange}
                 animationsEnabled={animationsEnabled}
                 onAnimationsToggle={handleAnimationsToggle}
+                trayEnabled={Boolean(config.tray_enabled)}
+                onTrayToggle={handleTrayToggle}
                 onTestTts={handleTestTts}
                 onPreviewVoice={handlePreviewVoice}
                 onLiveTtsChange={handleLiveTtsChange}
@@ -4153,6 +5055,7 @@ function App() {
                 isCheckingForUpdates={updateModal.loading}
                 onModerationToggle={handleModerationToggle}
                 onModerationSelectChange={handleModerationSelectChange}
+                onPermissionRoleToggle={handlePermissionRoleToggle}
                 onMaxRepetitionChange={handleMaxRepetitionChange}
                 onWordBlacklistChange={handleWordBlacklistChange}
                 onUserBlacklistChange={handleUserBlacklistChange}
@@ -4165,6 +5068,10 @@ function App() {
                 onToggleVtsEnabled={handleToggleVtsEnabled}
                 onVtsPortChange={handleVtsPortChange}
                 onToggleVtsConnection={handleToggleVtsConnection}
+                onToggleVtsChannel={handleVtsChannelToggle}
+                onVtsMappingChange={handleVtsMappingChange}
+                onVtsRangeChange={handleVtsRangeChange}
+                onRefreshVtsParameters={handleRefreshVtsParameters}
                 onCopyOverlayUrl={handleCopyOverlayUrl}
                 onToast={pushToast}
               />

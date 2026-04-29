@@ -8,6 +8,25 @@ use tauri::{Manager, PhysicalPosition, PhysicalSize, Position, Size};
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
+    .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+    .on_window_event(|window, event| {
+      if window.label() != "main" {
+        return;
+      }
+
+      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        if commands::consume_allow_window_close() {
+          return;
+        }
+
+        if commands::should_minimize_to_tray_on_close() {
+          api.prevent_close();
+          if commands::send_to_tray_runtime(&window.app_handle()).is_err() {
+            let _ = window.hide();
+          }
+        }
+      }
+    })
     .invoke_handler(tauri::generate_handler![
       commands::get_config,
       commands::save_config,
@@ -16,6 +35,9 @@ pub fn run() {
       commands::open_external_url,
       commands::download_and_run_installer,
       commands::exit_application,
+      commands::set_global_hotkeys,
+      commands::set_tray_enabled,
+      commands::send_to_tray,
       commands::update_tray_lang,
       commands::factory_reset,
       commands::fetch_azure_voices,
@@ -53,6 +75,8 @@ pub fn run() {
             .build(),
         )?;
       }
+
+      commands::bootstrap_runtime_features(&app.handle());
 
       if let Some(window) = app.get_webview_window("main") {
         let startup_window_state = commands::load_startup_window_state(&app.handle());

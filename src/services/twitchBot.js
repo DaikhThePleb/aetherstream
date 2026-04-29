@@ -117,6 +117,7 @@ export async function startTwitchBot({ username, token, onStatus, onLog }) {
       id: messageId || `${Date.now()}-${Math.random()}`,
       user: tags?.['display-name'] || tags?.username || 'unknown',
       username: tags?.username || '',
+      userId: tags?.['user-id'] || '',
       text: message || '',
       time: new Date().toLocaleTimeString(),
       rewardId: tags?.['custom-reward-id'] || null,

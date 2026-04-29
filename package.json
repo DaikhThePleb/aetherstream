@@ -3,7 +3,7 @@
   "author": "Daikh",
   "private": true,
   "license": "PolyForm-Noncommercial-1.0.0",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -21,6 +21,7 @@
     "react-dom": "^19.2.4",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
+    "react-icons": "^4.11.0",
     "tmi.js": "^1.8.5"
   },
   "devDependencies": {

@@ -4,16 +4,14 @@ const DEVELOPER_NAME = 'AetherStream'
 let socket = null
 let keepAliveTimer = null
 let authToken = ''
-
-let parameterConfig = {
-  MouthOpen: { min: 0, max: 1 },
-}
+let parameterCatalog = new Map()
 
 let status = {
   state: 'offline',
   port: 8001,
   authenticated: false,
   error: '',
+  parameters: [],
 }
 
 const listeners = new Set()
@@ -74,7 +72,38 @@ function sendRequest(messageType, data = {}) {
 }
 
 function requestParameterList() {
-  sendRequest('InputParameterListRequest', {})
+  return sendRequest('InputParameterListRequest', {})
+}
+
+function normalizeParameterEntry(parameter) {
+  const fallbackId = parameter?.id || parameter?.parameterID || parameter?.name || parameter?.parameterName
+  const id = String(fallbackId || '').trim()
+  if (!id) return null
+
+  const label = String(
+    parameter?.name
+    || parameter?.parameterName
+    || parameter?.id
+    || parameter?.parameterID
+    || id,
+  ).trim() || id
+  const min = Number(parameter?.min)
+  const max = Number(parameter?.max)
+  const defaultValue = Number(parameter?.defaultValue)
+
+  const safeMin = Number.isFinite(min) ? min : 0
+  const safeMax = Number.isFinite(max) ? max : 1
+  const safeDefaultValue = Number.isFinite(defaultValue)
+    ? defaultValue
+    : safeMin
+
+  return {
+    id,
+    name: label,
+    min: safeMin,
+    max: safeMax,
+    defaultValue: safeDefaultValue,
+  }
 }
 
 function sendAuthentication() {
@@ -92,7 +121,7 @@ function sendAuthentication() {
   }
 }
 
-function handleVtsMessage(rawMessage, onToken) {
+function handleVtsMessage(rawMessage, onToken, connectionContext = null) {
   let message
 
   try {
@@ -137,13 +166,30 @@ function handleVtsMessage(rawMessage, onToken) {
       requestParameterList()
       startKeepAlive()
     } else {
-      authToken = ''
+      const canRetryWithFreshToken = Boolean(connectionContext?.canRetryWithFreshToken)
+      const hadCachedToken = Boolean(authToken)
+
+      if (hadCachedToken && canRetryWithFreshToken) {
+        authToken = ''
+        if (connectionContext) {
+          connectionContext.canRetryWithFreshToken = false
+        }
+
+        // Cached token can become stale. Request a fresh token once before failing.
+        sendAuthentication()
+        emitStatus({
+          state: 'authorizing',
+          authenticated: false,
+          error: '',
+        })
+        return
+      }
+
       emitStatus({
         state: 'denied',
         authenticated: false,
         error: 'vts_auth_denied',
       })
-      disconnectVts()
     }
 
     return
@@ -152,18 +198,33 @@ function handleVtsMessage(rawMessage, onToken) {
   if (type === 'InputParameterListResponse') {
     const defaultParameters = Array.isArray(data?.defaultParameters) ? data.defaultParameters : []
     const customParameters = Array.isArray(data?.customParameters) ? data.customParameters : []
-    const allParameters = [...defaultParameters, ...customParameters]
+    const directParameters = Array.isArray(data?.parameters) ? data.parameters : []
+    const inputParameters = Array.isArray(data?.inputParameters) ? data.inputParameters : []
 
-    const mouthParameter = allParameters.find((parameter) => parameter?.name === 'MouthOpen')
-    if (mouthParameter) {
-      parameterConfig = {
-        ...parameterConfig,
-        MouthOpen: {
-          min: Number.isFinite(Number(mouthParameter.min)) ? Number(mouthParameter.min) : 0,
-          max: Number.isFinite(Number(mouthParameter.max)) ? Number(mouthParameter.max) : 1,
-        },
-      }
-    }
+    const allParameters = [
+      ...defaultParameters,
+      ...customParameters,
+      ...directParameters,
+      ...inputParameters,
+    ]
+      .map((parameter) => normalizeParameterEntry(parameter))
+      .filter(Boolean)
+
+    const deduped = new Map()
+    allParameters.forEach((parameter) => {
+      deduped.set(parameter.id, parameter)
+    })
+
+    const normalizedParameters = [...deduped.values()]
+      .sort((left, right) => left.name.localeCompare(right.name))
+
+    parameterCatalog = new Map(normalizedParameters.map((parameter) => [parameter.id, parameter]))
+    emitStatus({
+      state: 'connected',
+      authenticated: true,
+      error: '',
+      parameters: normalizedParameters,
+    })
 
     return
   }
@@ -232,6 +293,9 @@ export function connectVts({ port = 8001, token = '', onToken } = {}) {
 
   const currentSocket = socket
   let hadSocketError = false
+  const connectionContext = {
+    canRetryWithFreshToken: true,
+  }
 
   socket.onopen = () => {
     if (socket !== currentSocket) return
@@ -246,7 +310,7 @@ export function connectVts({ port = 8001, token = '', onToken } = {}) {
 
   socket.onmessage = (event) => {
     if (socket !== currentSocket) return
-    handleVtsMessage(event?.data, onToken)
+    handleVtsMessage(event?.data, onToken, connectionContext)
   }
 
   socket.onerror = () => {
@@ -259,18 +323,21 @@ export function connectVts({ port = 8001, token = '', onToken } = {}) {
     })
   }
 
-  socket.onclose = () => {
+  socket.onclose = (event) => {
     if (socket !== currentSocket) return
     stopKeepAlive()
     socket = null
 
     const closedDuringHandshake = status.state === 'connecting' || status.state === 'authorizing'
+    const closeCode = Number(event?.code)
+    const closeReason = String(event?.reason || '').trim()
+    const wasUnexpectedClose = Number.isFinite(closeCode) && closeCode !== 1000
 
-    if (hadSocketError || closedDuringHandshake) {
+    if (hadSocketError || closedDuringHandshake || wasUnexpectedClose) {
       emitStatus({
         state: 'error',
         authenticated: false,
-        error: 'vts_socket_error',
+        error: closeReason || `vts_socket_error${Number.isFinite(closeCode) ? `_${closeCode}` : ''}`,
       })
       return
     }
@@ -279,6 +346,7 @@ export function connectVts({ port = 8001, token = '', onToken } = {}) {
       state: 'offline',
       authenticated: false,
       error: '',
+      parameters: [],
     })
   }
 }
@@ -300,29 +368,72 @@ export function disconnectVts() {
     state: 'offline',
     authenticated: false,
     error: '',
+    parameters: [],
   })
 }
 
-export function injectVtsMouth(value) {
+export function requestVtsParameters() {
+  if (status.state !== 'connected') return false
+  return requestParameterList()
+}
+
+export function injectVtsParameters(parameterValues = [], options = {}) {
   if (!isSocketOpen() || status.state !== 'connected') {
     return false
   }
 
-  const numeric = Number(value)
-  const min = parameterConfig?.MouthOpen?.min ?? 0
-  const max = parameterConfig?.MouthOpen?.max ?? 1
+  if (!Array.isArray(parameterValues) || parameterValues.length === 0) {
+    return false
+  }
 
-  const clamped = Number.isFinite(numeric)
-    ? Math.max(min, Math.min(max, numeric))
-    : 0
+  const requestedMode = String(options?.mode || 'set').toLowerCase()
+  const mode = requestedMode === 'add' ? 'add' : 'set'
+
+  const dedupedById = new Map()
+
+  parameterValues.forEach((entry) => {
+    const id = String(entry?.id || '').trim()
+    const numericValue = Number(entry?.value)
+    if (!id || !Number.isFinite(numericValue)) {
+      return
+    }
+
+    const bounds = parameterCatalog.get(id)
+    const min = Number.isFinite(bounds?.min) ? Number(bounds.min) : 0
+    const max = Number.isFinite(bounds?.max) ? Number(bounds.max) : 1
+    let clamped = Math.max(Math.min(min, max), Math.min(Math.max(min, max), numericValue))
+
+    if (mode === 'add') {
+      const deltaLimit = Math.max(1, Math.abs(max - min))
+      clamped = Math.max(-deltaLimit, Math.min(deltaLimit, numericValue))
+    }
+
+    dedupedById.set(id, {
+      id,
+      value: clamped,
+    })
+  })
+
+  if (!dedupedById.size) {
+    return false
+  }
 
   return sendRequest('InjectParameterDataRequest', {
-    parameterValues: [
-      {
-        id: 'MouthOpen',
-        value: clamped,
-      },
-    ],
-    mode: 'set',
+    parameterValues: [...dedupedById.values()],
+    mode,
   })
+}
+
+export function injectVtsMouth(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) {
+    return false
+  }
+
+  return injectVtsParameters([
+    {
+      id: 'MouthOpen',
+      value: numeric,
+    },
+  ])
 }
