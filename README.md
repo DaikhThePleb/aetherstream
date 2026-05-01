@@ -1,3 +1,6 @@
+[![Version](https://img.shields.io/github/v/release/DaikhThePleb/aetherstream)](https://github.com/DaikhThePleb/aetherstream/releases/latest)
+[![License](https://img.shields.io/badge/License-PolyForm%20Noncommercial-8000ff)](LICENSE)
+
 # 🎙️ AetherStream
 
 > **Elevate your Twitch streams with crystal-clear, natural-sounding Text-to-Speech.**
